@@ -47,6 +47,8 @@ export interface UseConversationResult {
   start: (goal: ConversationGoal) => void;
   /** Starts a fresh session with the same goal. Used to retry after a failure. */
   restart: () => void;
+  /** Tears down the current engine and clears the session. Used when switching engines. */
+  reset: () => void;
   pause: () => void;
   resume: () => void;
   /**
@@ -152,15 +154,34 @@ export function useConversation(options: UseConversationOptions = {}): UseConver
     return () => clearInterval(interval);
   }, [status]);
 
-  useEffect(
-    () => () => {
-      unsubscribeRef.current?.();
-      unsubscribeRef.current = null;
-      serviceRef.current?.dispose?.();
-      serviceRef.current = null;
-    },
-    []
-  );
+  /** Drops the current engine and its subscription. Refs only: no state writes. */
+  const disposeService = useCallback(() => {
+    unsubscribeRef.current?.();
+    unsubscribeRef.current = null;
+    serviceRef.current?.dispose?.();
+    serviceRef.current = null;
+  }, []);
+
+  useEffect(() => disposeService, [disposeService]);
+
+  /**
+   * Ends the current engine and clears the session, keeping the goal so the next
+   * `start` can reuse it. Called when the user switches engines, so the switch
+   * always takes effect instead of silently continuing on the old one.
+   */
+  const reset = useCallback(() => {
+    disposeService();
+    accumulatedRef.current = 0;
+    runStartRef.current = null;
+    limitReachedRef.current = false;
+    setStatus('idle');
+    setEntries([]);
+    setCues([]);
+    setError(null);
+    setNotice(null);
+    setElapsedMs(0);
+    setLimitReached(false);
+  }, [disposeService]);
 
   const start = useCallback(
     (goal: ConversationGoal) => {
@@ -215,6 +236,7 @@ export function useConversation(options: UseConversationOptions = {}): UseConver
       limitReached,
       start,
       restart,
+      reset,
       pause,
       resume,
       pushAudio,
@@ -231,6 +253,7 @@ export function useConversation(options: UseConversationOptions = {}): UseConver
       limitReached,
       start,
       restart,
+      reset,
       pause,
       resume,
       pushAudio,

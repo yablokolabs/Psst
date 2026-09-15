@@ -75,6 +75,7 @@ export default function LiveScreen() {
     limitReached,
     start,
     restart,
+    reset,
     pause,
     resume,
     pushAudio,
@@ -167,9 +168,15 @@ export default function LiveScreen() {
     }
   }, [finish, finishing]);
 
+  /**
+   * Explicit switch to the demo engine. The engine is torn down first so the
+   * change always takes effect, then the effect below restarts the session with
+   * a scripted conversation instead of quietly reusing the failed realtime one.
+   */
   const handleUseDemo = useCallback(() => {
+    reset();
     setEngine('mock');
-  }, []);
+  }, [reset]);
 
   const isPaused = status === 'paused';
   const isLive = status === 'listening';
