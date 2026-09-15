@@ -305,6 +305,18 @@ async function testRecap(realTranscript) {
     at: 4200,
   });
 
+  // First check the model itself, without the end-of-session budget, so a
+  // failure here is clearly a provider problem rather than a timeout.
+  const directStartedAt = Date.now();
+  const direct = await provider.summarize({
+    goal: SCENARIO.goal,
+    transcript: session.finalEntries,
+    cues: [],
+    durationMs: 4200,
+  });
+  console.log(`  direct summarize: ${Date.now() - directStartedAt}ms -> ${direct ? 'ok' : 'null'}`);
+  if (direct) console.log(`  direct summary: ${direct.summary}`);
+
   // Recap is generated once at the very end of a session, so a slower model call
   // is acceptable here; the live cue path keeps its own tighter budget.
   const recapStartedAt = Date.now();

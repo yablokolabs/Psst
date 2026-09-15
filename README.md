@@ -396,11 +396,14 @@ Run in this repository:
 | `npx expo-doctor` | 21/21 |
 | `npx expo export --platform android` | bundle succeeds |
 | `npm run server:smoke` | passes (offline, no provider credit) |
-| `npm run server:providers` | 9 passed, 0 failed — real ElevenLabs STT, real Sarvam decision |
+| `npm run server:providers` | 10 passed, 0 failed — real ElevenLabs STT, real Sarvam decision + recap |
 
 `server:providers` synthesises the acceptance sentence with ElevenLabs TTS, streams it through the
 production STT client and feeds the resulting real transcript to Sarvam. It asserts a cue for the
-price objection, `NO_ACTION` for small talk, and suppression of a repeated cue.
+price objection, `NO_ACTION` for small talk, suppression of a repeated cue, and a model-written
+recap. Measured results: real transcript *"We really like the product, but 2,000 dollars per month
+is above our budget."*, cues such as *"They stated their budget ceiling." / "Ask what their target
+range is."*, reasoning latency ≈ 2.8 s, recap ≈ 3.5 s.
 
 **Not verified:** microphone capture and app → backend streaming from a physical device. This
 machine has no microphone, so real STT has only been proven server-side. Treat the on-device steps

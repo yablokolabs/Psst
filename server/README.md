@@ -69,7 +69,7 @@ Endpoints:
 | `SARVAM_REASONING_EFFORT` | no | `low` (default, lowest cue latency), `medium`, `high`. |
 | `SARVAM_TIMEOUT_MS` | no | Reasoning budget before falling back to `NO_ACTION` (default 8000). |
 | `PSST_MIN_CUE_INTERVAL_MS` | no | Minimum gap between cues (default 12000). |
-| `PSST_RECAP_TIMEOUT_MS` | no | Budget for the model-written recap (default 6000). |
+| `PSST_RECAP_TIMEOUT_MS` | no | Budget for the model-written recap (default 10000, below the app's 12 s wait). |
 
 Never expose either key to the client, never rename them to `EXPO_PUBLIC_*`, never log them and
 never return them from an endpoint.
@@ -153,11 +153,19 @@ npm run providers -- --recap   # also exercise the model-written recap
 3. **Sarvam** — `decide()` runs on that transcript (expects `PSST` for the price objection),
    on a small-talk control (expects `NO_ACTION`) and on a repeated cue (expects suppression).
 
-Recorded result: 9 passed, 0 failed — real transcript
-*"We really like the product, but 2,000 dollars per month is above our budget."* and a real cue
-*"Customer stated a budget ceiling." / "Ask for their target budget range."* (confidence 0.95).
-Sarvam occasionally needs more than the 8 s live budget; the test widens its own budget and reports
-latency, while the live path deliberately stays short and degrades to `NO_ACTION`.
+Recorded result: **10 passed, 0 failed** — real transcript
+*"We really like the product, but 2,000 dollars per month is above our budget."*, real cues such as
+*"They stated their budget ceiling." / "Ask what their target range is."* and a real model-written
+recap. Reasoning latency is stable at roughly **2.8 s** across repeated runs.
+
+Two field findings are baked into `sarvam.js` and worth keeping in mind:
+
+- The model intermittently emits a **raw newline inside a JSON string**, which is invalid JSON even
+  though the structure is correct. `parseModelJson()` escapes in-string control characters instead
+  of discarding an otherwise usable cue.
+- It also ignored "max 10 words" until the prompt carried worked examples. With examples the cues
+  became glanceable *and* ~2.5× faster, because short answers are cheap answers. Both cue fields are
+  still clamped hard, so a chatty answer can never reach the screen as a paragraph.
 
 ## Design rules
 

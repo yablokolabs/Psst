@@ -30,8 +30,13 @@ const DEFAULT_MODEL = 'sarvam-105b-conversations';
 const DEFAULT_TIMEOUT_MS = 8000;
 /** Cues below this confidence are treated as noise. */
 const MIN_CONFIDENCE = 0.55;
-/** A cue must be readable at a glance mid-sentence. */
-const MAX_CUE_CHARS = 110;
+/**
+ * A cue must be readable at a glance mid-sentence, so both fields are clamped
+ * hard. Long output is not just ugly: it also costs latency, and a cue that
+ * arrives late is worthless in a live conversation.
+ */
+const MAX_OBSERVATION_CHARS = 64;
+const MAX_SUGGESTION_CHARS = 88;
 
 export { OUTCOME };
 
@@ -66,12 +71,12 @@ const DECISION_SCHEMA = {
     observation: {
       type: 'string',
       description:
-        'Max 10 words, a plain statement of what was noticed. Empty string when action is NO_ACTION.',
+        'Max 8 words: a plain statement of what was noticed, no advice and no question. Empty string when action is NO_ACTION.',
     },
     suggestion: {
       type: 'string',
       description:
-        'Max 10 words, an imperative for what to say or ask next. Empty string when action is NO_ACTION.',
+        'Max 10 words: an imperative for what to say or ask next. Empty string when action is NO_ACTION.',
     },
     confidence: {
       type: 'number',
@@ -96,35 +101,102 @@ const RECAP_SCHEMA = {
 };
 
 const DECISION_SYSTEM_PROMPT = [
-  "You are the reasoning engine inside Psst, a private real-time conversation copilot.",
+  'You are the reasoning engine inside Psst, a private real-time conversation copilot.',
   'You are NOT a chatbot and you never answer the conversation for the user.',
-  'You silently watch a live conversation and decide whether there is a genuinely useful moment to intervene.',
+  'You watch a live conversation silently and decide whether there is a genuinely useful moment',
+  'to intervene. The user is mid-conversation and cannot read more than a glance.',
   '',
-  'You have exactly two possible outcomes:',
+  'Exactly two outcomes:',
   'NO_ACTION - the default. Most utterances deserve this. Silence is a feature.',
   'PSST - only when the user would clearly benefit from a short prompt right now.',
   '',
-  'Choose PSST only for moments like: a missed opportunity, an important question left unanswered,',
-  'an objection, a contradiction, a commitment made, a deadline, an important price or number,',
-  'a negotiation opening, the user forgetting their own stated goal, or a clarification that unlocks progress.',
-  'If the line is small talk, filler, or simply restates what is already known, answer NO_ACTION.',
+  'Choose PSST only for: a missed opportunity, an important question left unanswered, an objection,',
+  'a contradiction, a commitment made, a deadline, an important price or number, a negotiation',
+  'opening, the user forgetting their own stated goal, or a clarification that unlocks progress.',
+  'Small talk, filler, or anything that merely restates what is already known is NO_ACTION.',
+  'If your best idea is already in the cue history, answer NO_ACTION.',
   '',
-  'When you do choose PSST:',
-  '- observation: at most 10 words. A flat statement of the situation. Not advice, not a question.',
+  'When you choose PSST, both fields are read at a glance mid-sentence:',
+  '- observation: at most 8 words. A flat statement of the situation. No advice, no questions.',
   '- suggestion: at most 10 words. An imperative the user can act on instantly.',
-  '- Never repeat or paraphrase a cue that was already given. If your best idea is already on the list, answer NO_ACTION.',
-  '- Never write paragraphs, explanations or pleasantries.',
+  'Never write full sentences, explanations, quoted speech or examples.',
+  'Never use quotation marks or line breaks inside a value.',
+  'If you cannot express it in 8 and 10 words, answer NO_ACTION.',
+  '',
+  'Good answers:',
+  '{"action":"PSST","observation":"They have not revealed their budget.","suggestion":"Ask what range they expected.","confidence":0.9}',
+  '{"action":"PSST","observation":"Joining bonus never came up.","suggestion":"Ask if a bonus is available.","confidence":0.8}',
+  '{"action":"NO_ACTION","observation":"","suggestion":"","confidence":0}',
   '',
   'Reply with JSON only.',
 ].join('\n');
 
 function clamp(text, max) {
-  const value = typeof text === 'string' ? text.trim().replace(/\s+/g, ' ') : '';
+  let value = typeof text === 'string' ? text.trim().replace(/\s+/g, ' ') : '';
+  // Strip wrapping quotes the model sometimes adds around a value.
+  value = value.replace(/^["']+|["']+$/g, '').trim();
   if (value.length <= max) return value;
-  // Cut on a word boundary so a long cue degrades into a shorter readable one.
+
+  // Cut on a word boundary so a long answer still degrades into a readable cue.
   const clipped = value.slice(0, max);
   const lastSpace = clipped.lastIndexOf(' ');
-  return `${(lastSpace > max * 0.5 ? clipped.slice(0, lastSpace) : clipped).replace(/[,;:.]$/, '')}…`;
+  return `${(lastSpace > max * 0.5 ? clipped.slice(0, lastSpace) : clipped).replace(/[,;:.]+$/, '')}…`;
+}
+
+/**
+ * Repairs raw control characters that appear *inside* JSON string values.
+ *
+ * Observed in practice: the model intermittently emits a real newline inside a
+ * string, which makes the payload invalid JSON even though the structure is
+ * correct. Escaping in-string control characters recovers the answer instead of
+ * throwing away a usable cue.
+ */
+function repairJsonControlChars(text) {
+  let output = '';
+  let inString = false;
+  let escaped = false;
+
+  for (const character of text) {
+    if (escaped) {
+      output += character;
+      escaped = false;
+      continue;
+    }
+    if (character === '\\') {
+      output += character;
+      escaped = true;
+      continue;
+    }
+    if (character === '"') {
+      inString = !inString;
+      output += character;
+      continue;
+    }
+    if (inString && (character === '\n' || character === '\r')) {
+      output += '\\n';
+      continue;
+    }
+    if (inString && character === '\t') {
+      output += '\\t';
+      continue;
+    }
+    output += character;
+  }
+
+  return output;
+}
+
+/** Parses model JSON, repairing in-string control characters if needed. */
+function parseModelJson(content) {
+  try {
+    return JSON.parse(content);
+  } catch {
+    try {
+      return JSON.parse(repairJsonControlChars(content));
+    } catch {
+      return null;
+    }
+  }
 }
 
 function describe(error) {
@@ -217,11 +289,9 @@ export class SarvamReasoningProvider {
       return { error: 'Sarvam returned an empty completion' };
     }
 
-    try {
-      return { data: JSON.parse(content) };
-    } catch {
-      return { error: 'Sarvam returned invalid JSON' };
-    }
+    const data = parseModelJson(content);
+    if (data === null) return { error: 'Sarvam returned invalid JSON' };
+    return { data };
   }
 
   /**
@@ -261,7 +331,9 @@ export class SarvamReasoningProvider {
       user,
       schema: DECISION_SCHEMA,
       schemaName: 'psst_decision',
-      maxTokens: 200,
+      // Comfortably above the expected answer size: truncation mid-JSON is the
+      // one failure mode a repair pass cannot fix.
+      maxTokens: 400,
     });
 
     if (!result || result.error || !result.data) {
@@ -281,8 +353,8 @@ export class SarvamReasoningProvider {
       return { outcome: OUTCOME.NO_ACTION };
     }
 
-    const observation = clamp(data.observation, MAX_CUE_CHARS);
-    const suggestion = clamp(data.suggestion, MAX_CUE_CHARS);
+    const observation = clamp(data.observation, MAX_OBSERVATION_CHARS);
+    const suggestion = clamp(data.suggestion, MAX_SUGGESTION_CHARS);
     const confidence = typeof data.confidence === 'number' ? data.confidence : 0;
 
     if (observation === '' || suggestion === '') {

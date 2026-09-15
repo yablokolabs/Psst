@@ -26,8 +26,12 @@ import { SarvamReasoningProvider, isSarvamConfigured } from './sarvam.js';
 
 export { OUTCOME };
 
-/** Model-written recap budget; the app waits 12s for the recap frame. */
-const RECAP_TIMEOUT_MS = Number(process.env.PSST_RECAP_TIMEOUT_MS ?? 6000);
+/**
+ * Model-written recap budget. Unlike a live cue this call is not latency
+ * critical — it runs once as the session ends, while the app waits 12s for the
+ * recap frame — so it gets a generous budget before falling back.
+ */
+const RECAP_TIMEOUT_MS = Number(process.env.PSST_RECAP_TIMEOUT_MS ?? 10000);
 
 /**
  * Builds the configured reasoning provider, or null when none is available.
