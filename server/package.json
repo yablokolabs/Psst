@@ -1,0 +1,20 @@
+{
+  "name": "psst-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Psst realtime backend: session WebSocket API, ElevenLabs realtime STT and conversation reasoning. Holds the server-side secrets.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "smoke": "node scripts/smoke.js",
+    "providers": "node scripts/provider-test.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

@@ -1,30 +1,38 @@
 /**
- * Below are the colors that are used in the app. The colors are defined in the light and dark mode.
- * There are many other ways to style your app. For example, [Nativewind](https://www.nativewind.dev/), [Tamagui](https://tamagui.dev/), [unistyles](https://reactnativeunistyles.vercel.app), etc.
+ * Psst design tokens.
+ *
+ * Psst is a dark-first brand: deep navy / near-black background, violet accent,
+ * soft lavender highlights. Both colour schemes resolve to the same palette so
+ * the app stays on-brand on every device (app.json pins the dark appearance).
  */
 
 import '@/global.css';
 
 import { Platform } from 'react-native';
 
-export const Colors = {
-  light: {
-    text: '#000000',
-    background: '#ffffff',
-    backgroundElement: '#F0F0F3',
-    backgroundSelected: '#E0E1E6',
-    textSecondary: '#60646C',
-  },
-  dark: {
-    text: '#ffffff',
-    background: '#000000',
-    backgroundElement: '#212225',
-    backgroundSelected: '#2E3135',
-    textSecondary: '#B0B4BA',
-  },
-} as const;
+export const Palette = {
+  background: '#08070F',
+  backgroundElevated: '#111026',
+  backgroundElement: '#15132E',
+  backgroundSelected: '#231F49',
+  border: '#26214A',
+  borderStrong: '#332B63',
 
-export type ThemeColor = keyof typeof Colors.light & keyof typeof Colors.dark;
+  text: '#F5F3FF',
+  textSecondary: '#A29BC7',
+  textFaint: '#6E6796',
+
+  accent: '#7C5CFF',
+  accentStrong: '#6A46F5',
+  accentSoft: '#C9BEFF',
+  accentWash: '#1B1740',
+  onAccent: '#FFFFFF',
+
+  live: '#9C8BFF',
+  success: '#4ED2A6',
+  warning: '#F2B457',
+  danger: '#FF7C8B',
+} as const;
 
 export const Fonts = Platform.select({
   ios: {
@@ -61,5 +69,15 @@ export const Spacing = {
   six: 64,
 } as const;
 
-export const BottomTabInset = Platform.select({ ios: 50, android: 80 }) ?? 0;
+export const Radii = {
+  sm: 10,
+  md: 16,
+  lg: 22,
+  xl: 28,
+  pill: 999,
+} as const;
+
+/** Minimum touch target on Android. */
+export const TouchTarget = 48;
+
 export const MaxContentWidth = 800;
