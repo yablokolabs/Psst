@@ -24,6 +24,13 @@
  * definition. Terminal statuses (`ended`, `error`) still come through, so the UI
  * always learns that the session is over.
  *
+ * The backend can end a session on its own (idle, duration or audio-budget
+ * limit) and it says so *before* it finalizes, so the microphone stops at once
+ * instead of running through the provider flush and recap generation. That
+ * announcement latches the same terminal flag, and the connection stays open for
+ * the recap: tapping End in that window keeps waiting for it rather than
+ * releasing the socket and losing the summary.
+ *
  * It fails soft: an unreachable or misconfigured backend produces an ERROR event
  * (and an honest recap), never a crash.
  */
@@ -104,6 +111,12 @@ export class RealtimeConversationService implements ConversationService {
   private unclaimedRecap: Recap | null = null;
   /** True once the backend has ended the session on its own. */
   private serverEnded = false;
+  /**
+   * True once the backend has announced the end but the recap has not landed
+   * yet: the session is closed to capture and audio, while the socket stays open
+   * for the summary that is still being prepared.
+   */
+  private serverEnding = false;
   private congestionReported = false;
   private droppedAudioFrames = 0;
   /** Cues that arrived after the session stopped listening. Diagnostics only. */
@@ -145,6 +158,7 @@ export class RealtimeConversationService implements ConversationService {
     this.startedAtIso = new Date().toISOString();
     this.unclaimedRecap = null;
     this.serverEnded = false;
+    this.serverEnding = false;
     this.congestionReported = false;
     this.droppedAudioFrames = 0;
     this.droppedStaleCues = 0;
@@ -264,8 +278,17 @@ export class RealtimeConversationService implements ConversationService {
 
   async stop(): Promise<Recap> {
     const durationMs = this.elapsed();
+    /** Was the app itself still driving the session when End was tapped? */
+    const wasLive = this.status !== 'error' && this.status !== 'ended';
+    /**
+     * The backend announced it is ending and its recap is still on its way.
+     * Ending from the app in that window must keep waiting for that recap
+     * instead of releasing the socket and losing it.
+     */
+    const awaitingAnnouncedRecap =
+      this.serverEnding && this.socketOpen && this.unclaimedRecap === null;
     const canWaitForRecap =
-      this.socketOpen && !this.serverEnded && this.status !== 'error' && this.status !== 'ended';
+      this.socketOpen && (awaitingAnnouncedRecap || (!this.serverEnded && wasLive));
 
     // Irreversible from here on: no backend message may restart this session.
     this.terminal = true;
@@ -275,7 +298,8 @@ export class RealtimeConversationService implements ConversationService {
     this.setStatus('ended');
 
     if (canWaitForRecap) {
-      this.send({ t: 'session.stop' });
+      // A backend that is already finalizing is never asked to stop again.
+      if (wasLive && !this.serverEnded) this.send({ t: 'session.stop' });
       const recap = await this.waitForRecap();
       this.teardownSocket();
       if (recap) return recap;
@@ -297,6 +321,7 @@ export class RealtimeConversationService implements ConversationService {
     this.pendingRecap = null;
     this.unclaimedRecap = null;
     this.serverEnded = false;
+    this.serverEnding = false;
     this.clearTimers();
     this.teardownSocket();
     this.listeners.clear();
@@ -310,14 +335,22 @@ export class RealtimeConversationService implements ConversationService {
     if (!message) return;
 
     switch (message.t) {
-      case 'status':
-        // A live status arriving after End is a stale acknowledgement, not a
-        // new instruction: it must not restart capture or reopen the audio path.
-        // Terminal statuses still pass, so the UI hears about the end of the
-        // session (an audio-budget or duration end arrives this way).
-        if (this.terminal && LIVE_STATUSES.includes(message.status)) break;
-        this.setStatus(message.status);
+      case 'status': {
+        const incoming = message.status;
+        // The backend says a session is over before it finalizes, so this is the
+        // signal that stops microphone capture right away — the recap is still
+        // being prepared and the connection stays open for it.
+        if (incoming === 'ended' || incoming === 'error') {
+          this.terminal = true;
+          if (incoming === 'ended') this.serverEnding = true;
+        }
+        // A live status arriving after the session is over is a stale
+        // acknowledgement, not a new instruction: it must not restart capture or
+        // reopen the audio path.
+        if (this.terminal && LIVE_STATUSES.includes(incoming)) break;
+        this.setStatus(incoming);
         break;
+      }
 
       case 'transcript.partial':
       case 'transcript.final': {
@@ -347,6 +380,7 @@ export class RealtimeConversationService implements ConversationService {
         break;
 
       case 'recap': {
+        this.serverEnding = false;
         if (this.pendingRecap) {
           this.settlePendingRecap(message.recap);
           break;
@@ -465,6 +499,9 @@ export class RealtimeConversationService implements ConversationService {
   }
 
   private fail(message: string): void {
+    // A failed session must not accept audio again either: only an explicit
+    // `start()` opens the audio path.
+    this.terminal = true;
     this.setStatus('error');
     this.emit({ type: 'ERROR', message });
   }

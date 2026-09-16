@@ -334,17 +334,22 @@ frames (pause/resume/stop) are never throttled, so a session can always be ended
 reports the effective numbers. The full table lives in `server/README.md`.
 
 Two ceilings end a session on their own, whichever comes first, and both do it the same visible way:
-one `notice` explaining which limit was reached, then a clean end that flushes what was already
-accepted and still delivers a recap. At the defaults, the **audio budget** (96 MiB) is the binding
-one for a real device — about 17½ minutes of continuous 48 kHz mono PCM16 (~52 min at 16 kHz) — while
-the **duration ceiling** is 60 minutes of wall-clock session time. Audio sent after either is dropped
-without repeating the explanation; the app stops capturing as soon as the end reaches it. If you
-raise one, raise the other with it so they stay consistent.
+one `notice` explaining which limit was reached, then the session is announced over (`status: ended`)
+*immediately* — so microphone capture stops at once — and only then is the flush done and the recap
+delivered. At the defaults, the **audio budget** (96 MiB) is the binding one for a real device — about
+17½ minutes of continuous 48 kHz mono PCM16 (~52 min at 16 kHz) — while the **duration ceiling** is
+60 minutes of wall-clock session time. Audio sent after either is dropped without repeating the
+explanation. If you raise one, raise the other with it so they stay consistent.
+
+Ending is terminal in the app: a delayed `listening` acknowledgement can never restart capture or
+reopen the audio path, whether End came from the user or from a backend limit. In either case the
+connection stays open for the recap — tapping End while that recap is being prepared keeps waiting for
+it instead of dropping it.
 
 Session ids come from the app's URL, and a second live connection claiming an id that is already
-streaming is refused with `409 Conflict` rather than silently taking over the first session. Once
-End is tapped, the app treats the session as terminal: a delayed `listening` acknowledgement can
-never restart capture or reopen the audio path, and the recap still arrives.
+streaming is refused with `409 Conflict` rather than silently taking over the first session. The
+concurrency cap is reserved before the handshake completes and released again when a handshake never
+does, so refused upgrades cannot consume a slot a real client needs.
 
 ## Expo Go limitations
 
@@ -435,7 +440,8 @@ error) — it never substitutes demo transcript text.
 | 5 | Airplane mode mid-session | ONE clear failure notice, no silent demo fallback, honest recap still offered |
 | 6 | Real cue latency | a genuine cue appears within a few seconds of the trigger sentence |
 | 7 | **Pause** → **Resume** quickly after speaking | no cue about the pre-pause sentence appears after resume; new speech still cues normally |
-| 8 | Leave the session running to the audio/duration limit (or set a small `PSST_MAX_SESSION_AUDIO_BYTES` on a test backend) | ONE notice naming the limit, capture stops, a recap is still delivered |
+| 8 | Leave the session running to the audio/duration limit (or set a small `PSST_MAX_SESSION_AUDIO_BYTES` on a test backend) | ONE notice naming the limit, the chip goes `MIC OFF` at once (before the recap appears), and a recap is still delivered |
+| 8b | Tap **End** in the moment between that notice and the recap | the recap still appears (no local fallback, no empty screen) |
 | 9 | Second device/tab opening the same session id while one is live | the second connection is refused (409); the first session keeps working |
 | 10 | `GET /health` on the VM | `elevenlabsConfigured`/`sarvamConfigured` true, limits listed, no key material |
 
@@ -463,9 +469,11 @@ curl -s https://your-psst-backend.example.com/health | jq
 - **A final arriving while an evaluation is running is coalesced**, not dropped: the latest relevant
   utterance is evaluated as soon as the current request finishes. A result that comes back after a
   pause, stop or detach is discarded before it can reach the screen.
-- **Pause is a boundary, not a bookmark.** Pausing invalidates in-flight reasoning and clears queued
-  work, so a cue about speech from before the pause cannot surface after the user resumes; nothing is
-  reasoned about while paused, while the transcript keeps being recorded for the recap.
+- **Pause is a boundary, not a bookmark.** Pausing invalidates in-flight reasoning, clears queued work
+  and invalidates work that is waiting on the minimum cue interval — each piece of work keeps the
+  session state it was scheduled under, so a cue about speech from before the pause cannot surface
+  after the user resumes. Nothing is reasoned about while paused, while the transcript keeps being
+  recorded for the recap.
 - **On stop**, the session stops accepting audio immediately, the provider is asked to commit with
   the documented flush (an empty `input_audio_chunk` with `commit: true`), the final transcript is
   given a bounded window to land, and only then is the provider socket closed — the microphone is
@@ -480,7 +488,7 @@ Run in this repository:
 
 | Check | Result |
 | --- | --- |
-| `npm test` | **70 passed, 0 failed** — 53 backend + 17 app transport, offline, no provider credit |
+| `npm test` | **77 passed, 0 failed** — 58 backend + 19 app transport, offline, no provider credit |
 | `npm run server:smoke` | passes (offline, no provider credit) |
 | `npm run lint` | 0 errors, 0 warnings (the backend and the test suites are linted as Node ESM now) |
 | `npx tsc --noEmit` | clean |
@@ -498,9 +506,12 @@ setup, no microphone frames after Stop while the recap is delayed, a delayed `st
 after End neither restarting capture nor letting audio out while the recap still lands, the pause
 boundary invalidating in-flight reasoning (and new speech still producing a fresh cue),
 final-utterance preservation through a stop, pending-final coalescing, stale-cue rejection, duplicate
-and over-limit session ids (409/503, with slots freed and cleaned up), the audio budget ending a
-session visibly with an honest recap, and bounded audio buffering. It never calls a provider and
-never needs a microphone.
+and over-limit session ids (409/503, with slots freed and cleaned up), refused and abandoned
+handshakes releasing their session slot, concurrent admission staying inside the cap, the audio
+budget and duration endings announcing the end immediately (with the flush and recap deliberately
+delayed) and still delivering exactly one honest recap, work waiting on the minimum cue interval being
+invalidated by a pause, and bounded audio buffering. It never calls a provider and never needs a
+microphone.
 
 `server:providers` synthesises the acceptance sentence with ElevenLabs TTS, streams it through the
 production STT client and feeds the resulting real transcript to Sarvam. It asserts a cue for the

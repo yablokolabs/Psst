@@ -145,6 +145,12 @@ second upgrade for an id that is already streaming is refused with `409 Conflict
 replacing the first session (the concurrency cap answers `503`). A connection only ever removes its
 own registration when it closes.
 
+A session slot is reserved before the handshake completes and released again if the handshake never
+does: an invalid `Sec-WebSocket-Key` (HTTP 400), a socket that dies mid-upgrade, or an upgrade
+exception all free the reservation immediately. Leaking one would permanently consume part of the
+concurrency budget, so a refused handshake can never cost a real client a slot. Cleanup is idempotent
+and identity-checked: a closing connection only ever deletes its own registration.
+
 Parsing is total by construction: numeric fields (`seq`, `byteLength`, `audio.sampleRate`) are
 treated as numbers or numeric strings and nothing else. JSON such as
 `{"toString":null,"valueOf":null}` is valid input for `Number()`, which throws on it, so it is
@@ -165,13 +171,18 @@ rather than half-trusted.
 
 ### Finalization (stop)
 
-When a session stops, the session object stops accepting audio immediately, then the provider is
-asked to commit with the endpoint's documented flush — `input_audio_chunk` with an empty
-`audio_base_64` and `commit: true` — and the resulting `committed_transcript` is given a bounded
-window (`PSST_STT_FLUSH_TIMEOUT_MS`) to arrive before the provider socket closes. That final
-utterance is recorded and appears in the recap; it is deliberately not reasoned about, because the
-user already ended the session. The physical microphone is off by then: nothing is synthesised or
-kept open to force a commit.
+When a session stops, the session object stops accepting audio immediately and the app is told the
+session is over **before** any finalization work starts (`status: ended`). That ordering is what stops
+microphone capture at the client at once: the provider flush and recap generation can take seconds,
+and an audio-budget or duration end must not leave the microphone running through them. The connection
+stays open — the app waits on it for the recap.
+
+After that announcement the provider is asked to commit with the endpoint's documented flush —
+`input_audio_chunk` with an empty `audio_base_64` and `commit: true` — and the resulting
+`committed_transcript` is given a bounded window (`PSST_STT_FLUSH_TIMEOUT_MS`) to arrive before the
+provider socket closes. That final utterance is recorded and appears in the recap; it is deliberately
+not reasoned about, because the user already ended the session. The physical microphone is off by
+then: nothing is synthesised or kept open to force a commit.
 
 ### Commit strategy
 
@@ -226,9 +237,12 @@ metadata carrying an object (`{"toString":null,"valueOf":null}`) that `Number()`
 sample rate arriving at the provider unchanged (16 k/44.1 k/48 k through the real wire), survival of a
 disconnect during STT connection setup, final-utterance preservation through a stop, the pause
 boundary invalidating in-flight reasoning, pending-final coalescing, stale-cue rejection, duplicate
-and over-limit session ids with their cleanup, the audio budget ending a session visibly with an
-honest recap, bounded audio buffering, and every limit above. From the repository root, `npm test`
-also runs the app-side transport tests in `test/client/`.
+and over-limit session ids with their cleanup, refused and abandoned handshakes releasing their
+reservation without eating the concurrency budget, concurrent admission inside the cap, the audio
+budget and duration endings announcing the end immediately (with the flush and recap deliberately
+delayed by the fakes) and still delivering exactly one honest recap, bounded audio buffering, and
+every limit above. From the repository root, `npm test` also runs the app-side transport tests in
+`test/client/`.
 
 `provider-test.js` is a genuine end-to-end check of the server-side pipeline:
 

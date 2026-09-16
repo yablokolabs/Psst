@@ -169,23 +169,55 @@ server.on('upgrade', (req, socket, head) => {
   const session = new ConversationSession({ id: sessionId });
   sessions.set(sessionId, session);
 
+  /**
+   * Releases this reservation: exactly once, and only for this session.
+   *
+   * A handshake can fail **without throwing and without invoking the callback** —
+   * an invalid `Sec-WebSocket-Key` is answered with HTTP 400, and a socket that
+   * already sent FIN is destroyed — so a reservation cannot be left to the
+   * connection handler alone. Leaking one would permanently consume a slot of the
+   * concurrency budget.
+   */
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    if (sessions.get(sessionId) === session) sessions.delete(sessionId);
+  };
+
+  /** Set by the upgrade callback; until then this reservation owns cleanup. */
+  let upgraded = false;
+  const releaseIfUnfinished = () => {
+    if (!upgraded) release();
+  };
+  // A socket that dies mid-handshake never reaches the connection handler.
+  socket.once('error', releaseIfUnfinished);
+  socket.once('close', releaseIfUnfinished);
+
   try {
     wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit('connection', ws, req, session);
+      // The handshake succeeded: the live connection now owns cleanup for this
+      // session, and shares the same idempotent, identity-checked release.
+      upgraded = true;
+      wss.emit('connection', ws, req, session, release);
     });
   } catch (error) {
-    // The handshake never completed, so nothing will clean this up for us.
-    if (sessions.get(sessionId) === session) sessions.delete(sessionId);
+    release();
     try {
       socket.destroy();
     } catch {
       // Already gone.
     }
     console.warn(`[psst] upgrade failed for ${sessionId}: ${String(error)}`);
+    return;
   }
+
+  // `ws` refuses a bad handshake by aborting the socket, not by throwing, so a
+  // missing callback is the only signal that this reservation is unconsumed.
+  if (!upgraded) release();
 });
 
-wss.on('connection', (socket, _req, session) => {
+wss.on('connection', (socket, _req, session, releaseReservation) => {
   const sessionId = session.id;
   totalSessions += 1;
 
@@ -194,9 +226,11 @@ wss.on('connection', (socket, _req, session) => {
    * never have been admitted, but a stale callback must still not be able to
    * evict a different live session.
    */
-  const releaseSession = () => {
-    if (sessions.get(sessionId) === session) sessions.delete(sessionId);
-  };
+  const releaseSession =
+    releaseReservation ??
+    (() => {
+      if (sessions.get(sessionId) === session) sessions.delete(sessionId);
+    });
 
   // One reasoning provider per session keeps the conversation state local.
   const provider = createReasoningProvider();
@@ -284,6 +318,13 @@ wss.on('connection', (socket, _req, session) => {
     // the user tapped End must never reach the provider or the session counters.
     session.end();
 
+    // Tell the app the session is over *now*, before the provider flush and the
+    // recap. This is what stops microphone capture at the client while the
+    // connection stays open for the recap that follows: waiting until the recap
+    // is ready would leave the microphone running through the whole finalization
+    // (an audio-budget or duration end reaches the app this way).
+    send(statusMessage('ended'));
+
     void transcription
       .finalize()
       .then(async () => {
@@ -300,7 +341,6 @@ wss.on('connection', (socket, _req, session) => {
         }
 
         send(recapMessage(recap));
-        send(statusMessage('ended'));
         releaseSession();
         // Close after the recap frame has been flushed. The app keeps its own
         // fallback recap if this never arrives.

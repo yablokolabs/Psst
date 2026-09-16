@@ -200,6 +200,55 @@ test('the pause boundary invalidates in-flight reasoning, and resume starts fres
   attachment.detach();
 });
 
+test('work waiting on the minimum gap is invalidated by a pause, and resume still cues new speech', async () => {
+  const provider = fakeReasoning(async (context, call) => {
+    if (call === 1) return { outcome: OUTCOME.NO_ACTION };
+    return {
+      outcome: OUTCOME.PSST,
+      cue: {
+        observation: `Heard: ${context.latest.text}`,
+        suggestion: 'Follow up on that.',
+        confidence: 0.9,
+      },
+    };
+  });
+
+  const { session, attachment, framesOf } = await attachReal({ provider });
+
+  // One evaluation completes, which arms the 600 ms minimum gap before the next.
+  commit('They mentioned their budget is tight this quarter.');
+  await waitFor(() => provider.calls.length === 1, { description: 'first evaluation' });
+
+  // A second final is queued while that gap is still running, so the drain loop
+  // is parked in its wait with this work in hand.
+  commit('We should ask whether the contract can be split.');
+  await sleep(100);
+  assert.equal(provider.calls.length, 1, 'the queued final is waiting, not evaluated yet');
+
+  // Pause and resume *while that wait is still in progress*.
+  session.pause();
+  attachment.pause();
+  session.resume();
+
+  // The gap expires. Work that was waiting belongs to the state before the
+  // pause, so it must not be evaluated at all — taking the epoch after the wait
+  // is what used to let it adopt the new epoch and cue after the resume.
+  await sleep(700);
+  assert.equal(
+    provider.calls.length,
+    1,
+    'pre-pause work must not reach the provider after a pause and resume'
+  );
+  assert.deepEqual(framesOf('psst'), [], 'and must never produce a cue');
+
+  // Speech spoken after the resume is valid new work and cues normally.
+  commit('They also want the onboarding included in the price.');
+  await waitFor(() => framesOf('psst').length === 1, { description: 'fresh cue after resume' });
+  assert.match(framesOf('psst')[0].cue.observation, /onboarding included/);
+
+  attachment.detach();
+});
+
 test('nothing is reasoned about while paused, and the transcript is still kept', async () => {
   const provider = fakeReasoning(async () => ({ outcome: OUTCOME.NO_ACTION }));
   const { session, attachment, framesOf } = await attachReal({ provider });

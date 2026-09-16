@@ -16,6 +16,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { createServer } from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,7 +34,11 @@ export function pcmSilence(ms, sampleRate) {
 /**
  * A fake ElevenLabs realtime endpoint.
  *
- * @param {{ announceSession?: boolean, replyToCommit?: boolean, commitText?: string }} [options]
+ * `commitDelayMs` deliberately slows the flush response, which is what makes a
+ * stop take time: the finalization window a session has to keep the connection
+ * open for its recap lives there.
+ *
+ * @param {{ announceSession?: boolean, replyToCommit?: boolean, commitText?: string, commitDelayMs?: number }} [options]
  */
 export async function startFakeProvider(initialOptions = {}) {
   /** Mutable: a test can change the provider's behaviour mid-session. */
@@ -65,12 +70,16 @@ export async function startFakeProvider(initialOptions = {}) {
       state.chunks.push({ ...message, url: req.url ?? '' });
 
       if (message.commit === true && options.replyToCommit !== false) {
-        socket.send(
-          JSON.stringify({
-            message_type: 'committed_transcript',
-            text: options.commitText ?? 'Two thousand dollars per month is above our budget.',
-          })
-        );
+        const reply = () =>
+          socket.send(
+            JSON.stringify({
+              message_type: 'committed_transcript',
+              text: options.commitText ?? 'Two thousand dollars per month is above our budget.',
+            })
+          );
+        const delay = Number(options.commitDelayMs ?? 0);
+        if (delay > 0) setTimeout(reply, delay);
+        else reply();
       }
     });
   });
@@ -120,6 +129,80 @@ export async function startFakeProvider(initialOptions = {}) {
         }
       }
       await new Promise((resolve) => wss.close(() => resolve()));
+    },
+  };
+}
+
+/**
+ * A fake Sarvam chat-completions endpoint.
+ *
+ * Only used when a test needs a deliberately slow **recap**: the backend asks the
+ * provider for the summary after it has flushed transcription, so delaying this
+ * response delays the recap itself. Offline, no key, no credit.
+ *
+ * @param {{ delayMs?: number, decision?: object, recap?: object }} [options]
+ */
+export async function startFakeSarvam(options = {}) {
+  const requests = [];
+  const decision = options.decision ?? {
+    action: 'NO_ACTION',
+    observation: '',
+    suggestion: '',
+    confidence: 0,
+  };
+  const recap = options.recap ?? {
+    summary: 'A deliberately delayed recap from the fake recap provider.',
+    keyPoints: ['The delayed recap key point.'],
+    commitments: [],
+    missed: [],
+    nextActions: [],
+  };
+
+  const server = createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      let payload = null;
+      try {
+        payload = JSON.parse(body);
+      } catch {
+        // Fall through with an unknown schema; the decision payload is harmless.
+      }
+      const schemaName = payload?.response_format?.json_schema?.name ?? '';
+      requests.push({ schemaName, at: Date.now() });
+
+      const respond = () => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify(schemaName === 'psst_recap' ? recap : decision),
+                },
+              },
+            ],
+          })
+        );
+      };
+
+      const delay = Number(options.delayMs ?? 0);
+      if (delay > 0) setTimeout(respond, delay);
+      else respond();
+    });
+    req.on('error', () => {});
+  });
+
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  return {
+    endpoint: `http://127.0.0.1:${server.address().port}/v1/chat/completions`,
+    requests,
+    delayMs: options.delayMs ?? 0,
+    close: async () => {
+      await new Promise((resolve) => server.close(resolve));
     },
   };
 }

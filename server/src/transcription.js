@@ -148,6 +148,10 @@ export function attachTranscription(session, emit, options = {}) {
   };
 
   const runReasoning = async (entry, myEpoch) => {
+    // Rechecked immediately before the provider call: work that went stale while
+    // it waited is not worth a request, let alone a cue.
+    if (!stillRelevant(myEpoch)) return;
+
     lastReasoningAt = Date.now();
     session.reasoningCalls += 1;
 
@@ -214,6 +218,11 @@ export function attachTranscription(session, emit, options = {}) {
         const { entry, queuedAt } = pendingFinal;
         pendingFinal = null;
 
+        // The epoch is captured *before* any wait. Taking it afterwards is how a
+        // pause during the minimum-gap delay handed pre-pause work the new epoch:
+        // the cue then looked fresh and surfaced after the user resumed.
+        const myEpoch = epoch;
+
         // Already superseded by newer speech, or too old to be worth a cue.
         if (Date.now() - queuedAt > PENDING_FINAL_MAX_AGE_MS) continue;
 
@@ -223,9 +232,11 @@ export function attachTranscription(session, emit, options = {}) {
           // A newer final arrived while we waited: evaluate that one instead.
           if (pendingFinal) continue;
           if (!listening()) break;
+          // The session crossed a boundary while we waited (pause/stop/detach):
+          // this final belongs to a conversation state that no longer applies.
+          if (myEpoch !== epoch) continue;
         }
 
-        const myEpoch = epoch;
         await runReasoning(entry, myEpoch);
       }
     } finally {

@@ -7,10 +7,16 @@
  *   test client -> ws -> src/index.js -> session -> transcription -> STT client
  *              -> fake provider
  *
+ * Some tests also use a deliberately slow fake Sarvam endpoint, because the
+ * recap is what a session keeps its connection open for after it has announced
+ * the end.
+ *
  * No provider credit is used and no microphone is needed.
  */
 
 import assert from 'node:assert/strict';
+import { request as httpRequest } from 'node:http';
+import net from 'node:net';
 import test from 'node:test';
 import { WebSocket } from 'ws';
 
@@ -20,6 +26,7 @@ import {
   pcmSilence,
   startBackend,
   startFakeProvider,
+  startFakeSarvam,
   startMessage,
   waitFor,
 } from './support/harness.js';
@@ -50,21 +57,79 @@ async function waitForActiveSessions(backend, expected) {
   throw new Error(`activeSessions stayed at ${last}, expected ${expected}`);
 }
 
-/** Spawns a backend wired to a fresh fake provider. */
-async function harness(env = {}, providerOptions = {}) {
+/**
+ * Spawns a backend wired to a fresh fake provider.
+ *
+ * The optional third argument adds a fake Sarvam endpoint, which is only needed
+ * by tests that want the recap itself to be slow.
+ */
+async function harness(env = {}, providerOptions = {}, sarvamOptions = null) {
   const fake = await startFakeProvider(providerOptions);
+  const sarvam = sarvamOptions ? await startFakeSarvam(sarvamOptions) : null;
   const backend = await startBackend({
     ELEVENLABS_STT_ENDPOINT: fake.endpoint,
+    ...(sarvam
+      ? {
+          SARVAM_API_KEY: 'test-key-never-sent-anywhere-real',
+          SARVAM_ENDPOINT: sarvam.endpoint,
+        }
+      : {}),
     ...env,
   });
   return {
     fake,
+    sarvam,
     backend,
     close: async () => {
       await backend.stop();
       await fake.close();
+      if (sarvam) await sarvam.close();
     },
   };
+}
+
+/** A handshake `ws` must refuse: the key is not 16 bytes of base64. */
+function attemptBadHandshake(port, sessionId = 'bad-handshake') {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest({
+      host: '127.0.0.1',
+      port,
+      path: `/sessions/${sessionId}/stream`,
+      headers: {
+        connection: 'Upgrade',
+        upgrade: 'websocket',
+        'sec-websocket-key': 'not-a-valid-key',
+        'sec-websocket-version': '13',
+      },
+    });
+    req.on('response', (response) => {
+      const status = response.statusCode;
+      response.resume();
+      resolve(status);
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+/** A valid upgrade whose socket dies before the handshake completes. */
+function abandonHandshake(port, sessionId = 'abandoned') {
+  return new Promise((resolve) => {
+    const socket = net.connect(port, '127.0.0.1', () => {
+      socket.write(
+        `GET /sessions/${sessionId}/stream HTTP/1.1\r\n` +
+          `Host: 127.0.0.1:${port}\r\n` +
+          'Connection: Upgrade\r\n' +
+          'Upgrade: websocket\r\n' +
+          `Sec-WebSocket-Key: ${Buffer.from('0123456789abcdef').toString('base64')}\r\n` +
+          'Sec-WebSocket-Version: 13\r\n\r\n'
+      );
+      socket.end();
+      socket.destroy();
+      resolve();
+    });
+    socket.on('error', () => resolve());
+  });
 }
 
 test('the backend survives a malformed audio frame and keeps the session alive', async () => {
@@ -274,6 +339,86 @@ test('a duplicate live session id is refused instead of overwriting the first', 
   }
 });
 
+test('a refused handshake releases its reservation instead of eating a slot', async () => {
+  const { backend, close } = await harness({ PSST_MAX_SESSIONS: '2' });
+
+  try {
+    // Two handshakes `ws` answers with 400: they return without throwing and
+    // without ever reaching the connection handler, which is exactly how a
+    // reservation used to stay allocated forever.
+    assert.equal(await attemptBadHandshake(backend.port, 'bad-one'), 400);
+    assert.equal(await attemptBadHandshake(backend.port, 'bad-two'), 400);
+    // A socket that dies mid-handshake is the other way to never arrive.
+    await abandonHandshake(backend.port, 'abandoned-one');
+    await abandonHandshake(backend.port, 'abandoned-two');
+    await sleep(150);
+
+    assert.equal(
+      (await backend.health()).activeSessions,
+      0,
+      'a handshake that never completed must not hold a session slot'
+    );
+
+    // The whole point: both slots are still available to real clients.
+    const first = await connectSession(backend.wsUrl('after-bad-one'));
+    await first.open();
+    first.send(startMessage());
+    await first.waitFor((message) => message.t === 'status' && message.status === 'listening');
+
+    const second = await connectSession(backend.wsUrl('after-bad-two'));
+    await second.open();
+    second.send(startMessage());
+    await second.waitFor((message) => message.t === 'status' && message.status === 'listening');
+
+    assert.equal((await backend.health()).activeSessions, 2);
+    assert.equal(backend.exited(), null);
+
+    first.close();
+    second.close();
+    await waitForActiveSessions(backend, 0);
+  } finally {
+    await close();
+  }
+});
+
+test('concurrent admission cannot exceed the cap', async () => {
+  const { backend, close } = await harness({ PSST_MAX_SESSIONS: '2' });
+
+  try {
+    const attempts = await Promise.all(
+      [1, 2, 3, 4, 5, 6].map(
+        (index) =>
+          new Promise((resolve) => {
+            const socket = new WebSocket(backend.wsUrl(`slot-${index}`));
+            socket.on('open', () => resolve({ socket }));
+            socket.on('error', (error) => resolve({ error: String(error.message) }));
+          })
+      )
+    );
+
+    const admitted = attempts.filter((attempt) => attempt.socket);
+    const refused = attempts.filter((attempt) => attempt.error);
+
+    assert.equal(admitted.length, 2, 'exactly the cap may be admitted');
+    assert.equal(refused.length, 4);
+    for (const attempt of refused) assert.match(attempt.error, /503/);
+    assert.equal((await backend.health()).activeSessions, 2);
+    assert.equal(backend.exited(), null);
+
+    for (const attempt of admitted) attempt.socket.close();
+    await waitForActiveSessions(backend, 0);
+
+    // Every slot is reusable again once the winners are gone.
+    const later = await connectSession(backend.wsUrl('after-the-rush'));
+    await later.open();
+    assert.equal((await backend.health()).activeSessions, 1);
+    later.close();
+    await waitForActiveSessions(backend, 0);
+  } finally {
+    await close();
+  }
+});
+
 test('the cap counts live connections, frees one slot at a time, and never evicts', async () => {
   const { backend, close } = await harness({ PSST_MAX_SESSIONS: '2' });
 
@@ -375,6 +520,146 @@ test('the audio budget ends the session visibly, then still delivers a recap', a
     const health = await backend.health();
     assert.equal(health.audioBudgetEnds, 1);
     assert.equal(health.limits.maxSessionAudioBytes, budget);
+
+    client.close();
+    await waitForActiveSessions(backend, 0);
+  } finally {
+    await close();
+  }
+});
+
+test('an audio-budget end stops capture immediately, with the recap still delayed behind it', async () => {
+  const budget = 4096;
+  const { fake, sarvam, backend, close } = await harness(
+    { PSST_MAX_SESSION_AUDIO_BYTES: String(budget) },
+    { replyToCommit: true, commitDelayMs: 400, commitText: 'Let us revisit the pricing next quarter.' },
+    {
+      delayMs: 600,
+      recap: {
+        summary: 'A delayed but honest recap of the session.',
+        keyPoints: ['The delayed recap key point.'],
+        commitments: [],
+        missed: [],
+        nextActions: [],
+      },
+    }
+  );
+
+  try {
+    const client = await connectSession(backend.wsUrl('budget-stop'));
+    await client.open();
+    client.send(startMessage());
+    await client.waitFor((message) => message.t === 'status' && message.status === 'listening');
+
+    const pcm = pcmSilence(64, 16000);
+    const framesToFill = budget / pcm.byteLength;
+    assert.equal(framesToFill * pcm.byteLength, budget, 'the budget must be an exact number of frames');
+
+    let seq = 0;
+    const sendFrame = () => {
+      seq += 1;
+      client.send(audioFrame({ pcm, sampleRate: 16000, seq }));
+    };
+    for (let index = 0; index < framesToFill; index += 1) sendFrame();
+    await waitFor(() => fake.audioChunks().length >= framesToFill, { description: 'the accepted audio' });
+    const acceptedChunks = fake.audioChunks().length;
+
+    sendFrame();
+    const notice = await client.waitFor(
+      (message) => message.t === 'notice' && /audio limit/.test(message.message),
+      8000
+    );
+    assert.equal(notice.level, 'warning');
+
+    // The terminal status must arrive *before* finalization finishes: that is
+    // what stops microphone capture while the flush and the recap are slow.
+    await client.waitFor((message) => message.t === 'status' && message.status === 'ended', 2000);
+    assert.equal(
+      client.messages.some((message) => message.t === 'recap'),
+      false,
+      'the end of the session must be announced before the recap is ready, not after it'
+    );
+
+    // Nothing is forwarded after that announcement, whatever keeps arriving.
+    for (let index = 0; index < 5; index += 1) sendFrame();
+    await sleep(700);
+    assert.equal(fake.audioChunks().length, acceptedChunks, 'no audio after the session ended');
+
+    const recapFrame = await client.waitFor((message) => message.t === 'recap', 12000);
+    assert.equal(
+      recapFrame.recap.summary,
+      'A delayed but honest recap of the session.',
+      'the delayed recap is still delivered'
+    );
+    assert.ok(sarvam.requests.some((entry) => entry.schemaName === 'psst_recap'));
+
+    await sleep(200);
+    assert.equal(
+      client.messages.filter((message) => message.t === 'recap').length,
+      1,
+      'exactly one recap remains available'
+    );
+    assert.equal(backend.exited(), null);
+
+    client.close();
+    await waitForActiveSessions(backend, 0);
+  } finally {
+    await close();
+  }
+});
+
+test('a duration-limit end also stops capture before its recap is ready', async () => {
+  const { fake, backend, close } = await harness(
+    { PSST_MAX_SESSION_DURATION_MS: '300' },
+    { replyToCommit: true, commitDelayMs: 400, commitText: 'We will review the numbers on Friday.' },
+    {
+      delayMs: 600,
+      recap: {
+        summary: 'The session hit its duration ceiling.',
+        keyPoints: ['The duration recap key point.'],
+        commitments: [],
+        missed: [],
+        nextActions: [],
+      },
+    }
+  );
+
+  try {
+    const client = await connectSession(backend.wsUrl('duration-stop'));
+    await client.open();
+    client.send(startMessage());
+    await client.waitFor((message) => message.t === 'status' && message.status === 'listening');
+
+    // One frame opens the provider session, so the flush has something to commit.
+    client.send(audioFrame({ pcm: pcmSilence(64, 16000), sampleRate: 16000, seq: 1 }));
+    await waitFor(() => fake.audioChunks().length > 0, { description: 'the first audio chunk' });
+    const acceptedChunks = fake.audioChunks().length;
+
+    const notice = await client.waitFor(
+      (message) => message.t === 'notice' && /limit and was ended/.test(message.message),
+      8000
+    );
+    assert.equal(notice.level, 'warning');
+
+    await client.waitFor((message) => message.t === 'status' && message.status === 'ended', 2000);
+    assert.equal(
+      client.messages.some((message) => message.t === 'recap'),
+      false,
+      'the terminal status must not wait for the recap'
+    );
+
+    let seq = 1;
+    for (let index = 0; index < 5; index += 1) {
+      seq += 1;
+      client.send(audioFrame({ pcm: pcmSilence(64, 16000), sampleRate: 16000, seq }));
+    }
+    await sleep(700);
+    assert.equal(fake.audioChunks().length, acceptedChunks, 'no audio after the session ended');
+
+    const recapFrame = await client.waitFor((message) => message.t === 'recap', 12000);
+    assert.equal(recapFrame.recap.summary, 'The session hit its duration ceiling.');
+    await sleep(200);
+    assert.equal(client.messages.filter((message) => message.t === 'recap').length, 1);
 
     client.close();
     await waitForActiveSessions(backend, 0);

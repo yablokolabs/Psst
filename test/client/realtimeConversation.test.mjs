@@ -11,6 +11,8 @@
  *   - End is irreversible: a delayed `status: listening` acknowledgement cannot
  *     restart the session or reopen the audio path, while terminal statuses and
  *     the recap still get through
+ *   - a backend that announces the end stops capture before its recap exists,
+ *     and tapping End in that window still receives that recap exactly once
  *   - a cue produced for speech from before a pause/stop never reaches the UI
  *   - a stalled socket drops live audio instead of growing a backlog
  *   - the recap that arrives after End is still used
@@ -246,6 +248,83 @@ test('a backend that ends the session itself stops capture and its recap is reus
     0,
     'a backend-initiated end is not a connection failure'
   );
+});
+
+test('a backend-announced end stops capture at once and the delayed recap survives a tap on End', async () => {
+  const { service, socket, events } = startSession();
+
+  service.pushAudio(pcmFrame());
+  const sentBefore = socket.frames('audio.frame').length;
+  assert.equal(sentBefore, 1);
+
+  // The backend reached a limit: it explains first, then says the session is
+  // over, and only afterwards finishes the flush and the recap.
+  socket.deliver({
+    t: 'notice',
+    level: 'warning',
+    message:
+      'This session reached the 96 MB audio limit (about 17 minutes of speech at 48 kHz) and was ended. Your recap is below.',
+  });
+  socket.deliver({ t: 'status', status: 'ended' });
+
+  assert.equal(
+    service.getStatus(),
+    'ended',
+    'capture eligibility must end the moment the backend says the session is over'
+  );
+
+  // Capture is still delivering buffers until the mic is torn down: none may go out.
+  service.pushAudio(pcmFrame());
+  service.pushAudio(pcmFrame());
+  assert.equal(socket.frames('audio.frame').length, sentBefore, 'no audio after the announced end');
+
+  // A late acknowledgement must not reopen it either.
+  socket.deliver({ t: 'status', status: 'listening' });
+  assert.equal(service.getStatus(), 'ended');
+  service.pushAudio(pcmFrame());
+  assert.equal(socket.frames('audio.frame').length, sentBefore);
+
+  // The user taps End while the recap is still being prepared. The connection
+  // must stay open for it, and the backend must not be asked to stop twice.
+  const stopping = service.stop();
+  assert.equal(socket.closed, false, 'the socket stays open for the recap that is coming');
+  assert.deepEqual(
+    socket.frames('session.stop'),
+    [],
+    'a backend that is already finalizing is not asked to stop again'
+  );
+
+  socket.deliver({ t: 'recap', recap: SERVER_RECAP });
+  const recap = await stopping;
+
+  assert.equal(recap.id, 'server-recap', 'the announced recap is delivered, not a local fallback');
+  assert.equal(recap.summary, SERVER_RECAP.summary);
+  assert.equal(socket.closed, true, 'and the socket is released once it has arrived');
+  assert.equal(
+    events.filter((event) => event.type === 'NOTICE').length,
+    1,
+    'the reason for the end was shown once'
+  );
+  assert.equal(
+    events.filter((event) => event.type === 'ERROR').length,
+    0,
+    'a backend-initiated end is not an error'
+  );
+});
+
+test('tapping End while a backend-announced recap never arrives still falls back honestly', async () => {
+  const { service, socket } = startSession();
+
+  socket.deliver({ t: 'status', status: 'ended' });
+  const stopping = service.stop();
+  assert.equal(socket.closed, false, 'the socket is kept open for the recap');
+
+  // The socket dies before the recap lands: no invented summary, no hang.
+  socket.remoteClose();
+  const recap = await stopping;
+
+  assert.match(recap.summary, /did not return a summary/);
+  assert.equal(service.getStatus(), 'ended');
 });
 
 test('only an explicitly started new session clears the terminal guard', async () => {
