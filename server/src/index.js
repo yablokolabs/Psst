@@ -42,11 +42,26 @@ const SESSION_PATH = /^\/sessions\/([^/]+)\/stream$/;
 /** Longest session id accepted in the URL. */
 const MAX_SESSION_ID_CHARS = 120;
 
-/** @type {Map<string, ConversationSession>} */
+/**
+ * Live sessions, keyed by session id.
+ *
+ * A session is registered **before** the upgrade completes, so the cap check and
+ * the id check are atomic with admission: nothing else can claim the same id or
+ * the same last slot while the handshake is in flight.
+ *
+ * @type {Map<string, ConversationSession>}
+ */
 const sessions = new Map();
 let totalSessions = 0;
 /** Process-wide counters for /health. Numbers only. */
-const counters = { rejectedAudioFrames: 0, throttledMessages: 0, idleTimeouts: 0, durationLimitEnds: 0 };
+const counters = {
+  rejectedAudioFrames: 0,
+  throttledMessages: 0,
+  idleTimeouts: 0,
+  durationLimitEnds: 0,
+  audioBudgetEnds: 0,
+  handlerErrors: 0,
+};
 
 function minutes(ms) {
   return Math.round(ms / 60000);
@@ -56,6 +71,17 @@ function minutes(ms) {
 function describeDuration(ms) {
   if (ms < 60000) return `${Math.max(1, Math.round(ms / 1000))}-second`;
   return `${minutes(ms)}-minute`;
+}
+
+/** Human-readable byte size for limit messages. */
+function describeBytes(bytes) {
+  return `${Math.round(bytes / (1024 * 1024))} MB`;
+}
+
+/** Rough spoken duration of a PCM16 mono audio budget, for limit messages. */
+function describeAudioBudget(bytes) {
+  const secondsAt48k = bytes / (48000 * 2);
+  return `${Math.floor(secondsAt48k / 60)} minutes`;
 }
 
 function sendJson(res, statusCode, body) {
@@ -121,34 +147,68 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
 
+  const sessionId = match[1];
+
+  // Bounded concurrency: one deployment cannot be exhausted by connection churn.
   if (sessions.size >= LIMITS.maxSessions) {
-    // Bounded concurrency: one deployment cannot be exhausted by connection churn.
     socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
     socket.destroy();
     return;
   }
 
-  const sessionId = match[1];
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit('connection', ws, req, sessionId);
-  });
-});
+  // The cap alone is not enough: two connections claiming the same id would both
+  // pass it and the second would silently overwrite the first (and closing one
+  // would remove the other's entry). Duplicate ids are refused instead.
+  if (sessions.has(sessionId)) {
+    socket.write('HTTP/1.1 409 Conflict\r\n\r\n');
+    socket.destroy();
+    return;
+  }
 
-wss.on('connection', (socket, _req, sessionId) => {
+  // Reserve the slot and the id now, while the handshake is still synchronous.
   const session = new ConversationSession({ id: sessionId });
   sessions.set(sessionId, session);
+
+  try {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req, session);
+    });
+  } catch (error) {
+    // The handshake never completed, so nothing will clean this up for us.
+    if (sessions.get(sessionId) === session) sessions.delete(sessionId);
+    try {
+      socket.destroy();
+    } catch {
+      // Already gone.
+    }
+    console.warn(`[psst] upgrade failed for ${sessionId}: ${String(error)}`);
+  }
+});
+
+wss.on('connection', (socket, _req, session) => {
+  const sessionId = session.id;
   totalSessions += 1;
+
+  /**
+   * Removes this connection's registration, and only its own: a duplicate id can
+   * never have been admitted, but a stale callback must still not be able to
+   * evict a different live session.
+   */
+  const releaseSession = () => {
+    if (sessions.get(sessionId) === session) sessions.delete(sessionId);
+  };
 
   // One reasoning provider per session keeps the conversation state local.
   const provider = createReasoningProvider();
 
-  /** @type {{ detach: () => void, finalize: () => Promise<boolean>, commit: () => void }} */
-  let transcription = { detach: () => {}, finalize: async () => false, commit: () => {} };
+  /** @type {{ detach: () => void, finalize: () => Promise<boolean>, commit: () => void, pause: () => void }} */
+  let transcription = { detach: () => {}, finalize: async () => false, commit: () => {}, pause: () => {} };
   let started = false;
   let stopping = false;
   let closed = false;
   let unsupportedFormatReported = false;
   let oversizedFrameReported = false;
+  let audioBudgetReported = false;
   /** Simple per-second message budget: a client cannot flood the pipeline. */
   let rateWindowStart = Date.now();
   let rateWindowCount = 0;
@@ -241,7 +301,7 @@ wss.on('connection', (socket, _req, sessionId) => {
 
         send(recapMessage(recap));
         send(statusMessage('ended'));
-        sessions.delete(sessionId);
+        releaseSession();
         // Close after the recap frame has been flushed. The app keeps its own
         // fallback recap if this never arrives.
         setTimeout(() => {
@@ -255,7 +315,7 @@ wss.on('connection', (socket, _req, sessionId) => {
       })
       .catch((error) => {
         console.warn(`[psst] session finalization failed: ${String(error)}`);
-        sessions.delete(sessionId);
+        releaseSession();
       });
   };
 
@@ -282,7 +342,15 @@ wss.on('connection', (socket, _req, sessionId) => {
 
   armIdleTimer();
 
-  socket.on('message', (raw) => {
+  /**
+   * One client message, start to finish.
+   *
+   * Parsing is total by construction, but this runs on hostile input inside a
+   * network callback: anything unexpected is contained to the one frame instead
+   * of escaping as an uncaught exception that would kill the process for every
+   * session. The counter keeps it visible in /health rather than silent.
+   */
+  const handleMessage = (raw) => {
     if (closed) return;
     armIdleTimer();
 
@@ -326,6 +394,10 @@ wss.on('connection', (socket, _req, sessionId) => {
         // Audio stops flowing; the transcript and conversation state are kept,
         // and the STT session is left open so resuming is instant.
         session.pause();
+        // The pause boundary invalidates anything the model is still thinking
+        // about: a cue for speech from before the pause must not surface after
+        // the user resumes. Whatever was heard is kept for the recap.
+        transcription.pause();
         // With the manual commit strategy the provider never commits on its own,
         // so a pause is the one boundary the server can honestly commit on.
         transcription.commit();
@@ -341,9 +413,30 @@ wss.on('connection', (socket, _req, sessionId) => {
         finishSession();
         break;
 
-      case 'audio.frame':
-        session.pushAudioFrame(message);
+      case 'audio.frame': {
+        const outcome = session.pushAudioFrame(message);
+
+        // The session's audio budget is a hard ceiling, so it is handled
+        // visibly: one explanation, then a clean end that flushes what was
+        // already accepted and still delivers an honest recap. Frames arriving
+        // after this point are dropped without another word.
+        if (outcome === 'limit-reached' && !audioBudgetReported) {
+          audioBudgetReported = true;
+          counters.audioBudgetEnds += 1;
+          send(
+            noticeMessage(
+              'warning',
+              `This session reached the ${describeBytes(
+                LIMITS.maxSessionAudioBytes
+              )} audio limit (about ${describeAudioBudget(
+                LIMITS.maxSessionAudioBytes
+              )} of speech at 48 kHz) and was ended. Your recap is below.`
+            )
+          );
+          finishSession();
+        }
         break;
+      }
 
       case 'audio.frame.rejected': {
         counters.rejectedAudioFrames += 1;
@@ -373,6 +466,15 @@ wss.on('connection', (socket, _req, sessionId) => {
         break;
       }
     }
+  };
+
+  socket.on('message', (raw) => {
+    try {
+      handleMessage(raw);
+    } catch (error) {
+      counters.handlerErrors += 1;
+      console.warn(`[psst] dropped a client message that could not be handled: ${String(error)}`);
+    }
   });
 
   socket.on('error', () => {
@@ -384,8 +486,8 @@ wss.on('connection', (socket, _req, sessionId) => {
     closed = true;
     clearSessionTimers();
     transcription.detach();
-    transcription = { detach: () => {}, finalize: async () => false, commit: () => {} };
-    sessions.delete(sessionId);
+    transcription = { detach: () => {}, finalize: async () => false, commit: () => {}, pause: () => {} };
+    releaseSession();
   });
 });
 

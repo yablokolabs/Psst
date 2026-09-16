@@ -9,6 +9,8 @@
  *   - NO_ACTION, duplicate suppression, confidence filtering and the minimum
  *     interval are preserved
  *   - a result that lands after pause/stop/detach never reaches the UI
+ *   - the pause boundary invalidates in-flight reasoning, so a cue for pre-pause
+ *     speech cannot surface after the user resumes
  *   - the final utterance before a stop is kept and appears in the recap
  */
 
@@ -59,6 +61,8 @@ function fakeReasoning(handler) {
     },
   };
 }
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function deferred() {
   let resolve;
@@ -149,6 +153,77 @@ test('short utterances and repeats are never evaluated', async () => {
     session.finalEntries.some((entry) => entry.text === 'Yes.'),
     'a short utterance is still shown in the transcript, it is just never reasoned about'
   );
+  attachment.detach();
+});
+
+test('the pause boundary invalidates in-flight reasoning, and resume starts fresh', async () => {
+  const gate = deferred();
+  const cueAbout = (observation, suggestion) => ({
+    observation,
+    suggestion,
+    confidence: 0.9,
+  });
+  const provider = fakeReasoning(async (_context, call) => {
+    if (call === 1) {
+      // Reasoning for the pre-pause utterance is still in flight over the pause.
+      await gate.promise;
+      return { outcome: OUTCOME.PSST, cue: cueAbout('They never revealed their budget.', 'Ask for their range.') };
+    }
+    return { outcome: OUTCOME.PSST, cue: cueAbout('They mentioned a joining bonus.', 'Confirm the start date.') };
+  });
+
+  const { session, attachment, framesOf } = await attachReal({ provider });
+
+  commit('We really like the product so far.');
+  await waitFor(() => provider.calls.length === 1, { description: 'first evaluation' });
+
+  // The pause boundary is explicit: `pause()` advances the epoch, so a result
+  // produced for the old epoch is stale even after the user resumes.
+  session.pause();
+  attachment.pause();
+  session.resume();
+
+  gate.resolve();
+  await sleep(500);
+  assert.deepEqual(
+    framesOf('psst'),
+    [],
+    'a cue for speech from before the pause must never reach the UI, even after resume'
+  );
+
+  // New speech after resume is reasoned about fresh and still produces a cue.
+  commit('They also mentioned a joining bonus in the first year.');
+  await waitFor(() => framesOf('psst').length === 1, { description: 'fresh cue after resume' });
+  assert.equal(framesOf('psst')[0].cue.action, 'Confirm the start date.');
+  assert.equal(framesOf('psst')[0].cue.observation, 'They mentioned a joining bonus.');
+
+  attachment.detach();
+});
+
+test('nothing is reasoned about while paused, and the transcript is still kept', async () => {
+  const provider = fakeReasoning(async () => ({ outcome: OUTCOME.NO_ACTION }));
+  const { session, attachment, framesOf } = await attachReal({ provider });
+
+  commit('They said the budget is two thousand dollars.');
+  await waitFor(() => provider.calls.length === 1, { description: 'first evaluation' });
+
+  session.pause();
+  attachment.pause();
+
+  commit('Buying this would make the quarter for us.');
+  await sleep(400);
+
+  assert.equal(provider.calls.length, 1, 'a paused session must not start reasoning');
+  assert.ok(
+    framesOf('transcript.final').some((frame) => frame.entry.text.includes('make the quarter')),
+    'the transcript is still shown while paused'
+  );
+  assert.equal(
+    session.finalEntries.filter((entry) => entry.text.includes('make the quarter')).length,
+    1,
+    'and is kept for the recap'
+  );
+
   attachment.detach();
 });
 

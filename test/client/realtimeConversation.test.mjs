@@ -8,6 +8,9 @@
  *   - tapping End blocks outgoing audio immediately, while the recap is still
  *     in flight (the bug: the status stayed `listening`, so the mic kept
  *     capturing and frames kept flowing)
+ *   - End is irreversible: a delayed `status: listening` acknowledgement cannot
+ *     restart the session or reopen the audio path, while terminal statuses and
+ *     the recap still get through
  *   - a cue produced for speech from before a pause/stop never reaches the UI
  *   - a stalled socket drops live audio instead of growing a backlog
  *   - the recap that arrives after End is still used
@@ -164,6 +167,106 @@ test('tapping End cuts audio immediately, while the recap is still delayed', asy
   assert.equal(recap.id, 'server-recap');
   assert.equal(recap.summary, SERVER_RECAP.summary);
   assert.equal(socket.closed, true, 'the socket is released once the recap is in');
+});
+
+test('a delayed listening status after End cannot restart capture or audio', async () => {
+  const { service, socket, events } = startSession();
+
+  service.pushAudio(pcmFrame());
+  const before = socket.frames('audio.frame').length;
+  const stopping = service.stop();
+
+  assert.equal(service.getStatus(), 'ended');
+
+  // The backend accepted the start frame just before the stop frame reached it,
+  // so its `listening` acknowledgement arrives after End.
+  socket.deliver({ t: 'status', status: 'listening' });
+  assert.equal(service.getStatus(), 'ended', 'a stale status must not restart the session');
+  assert.equal(
+    events.filter((event) => event.type === 'STATUS' && event.status === 'listening').length,
+    1,
+    'only the original listening status is ever emitted'
+  );
+
+  socket.deliver({ t: 'status', status: 'paused' });
+  assert.equal(service.getStatus(), 'ended', 'nor put it into a live paused state');
+
+  // The native capture callback keeps firing until the mic is torn down.
+  service.pushAudio(pcmFrame());
+  service.pushAudio(pcmFrame());
+  assert.equal(socket.frames('audio.frame').length, before, 'no audio may be sent after End');
+
+  // Nor may the app talk its way back into a live session.
+  service.resume();
+  assert.equal(service.getStatus(), 'ended');
+  assert.deepEqual(socket.frames('session.resume'), [], 'no resume is sent after End');
+
+  // The whole point of keeping the socket open still works.
+  socket.deliver({ t: 'recap', recap: SERVER_RECAP });
+  const recap = await stopping;
+  assert.equal(recap.id, 'server-recap');
+  socket.deliver({ t: 'status', status: 'ended' });
+  assert.equal(service.getStatus(), 'ended');
+});
+
+test('a backend that ends the session itself stops capture and its recap is reused', async () => {
+  const { service, socket, events } = startSession();
+
+  socket.deliver({
+    t: 'notice',
+    level: 'warning',
+    message: 'This session reached the 96 MB audio limit (about 17 minutes of speech at 48 kHz) and was ended. Your recap is below.',
+  });
+  socket.deliver({ t: 'recap', recap: SERVER_RECAP });
+
+  assert.equal(
+    service.getStatus(),
+    'ended',
+    'microphone capture must stop as soon as the backend ends the session'
+  );
+  assert.equal(
+    events.filter((event) => event.type === 'NOTICE').length,
+    1,
+    'the user is told why the session ended'
+  );
+
+  service.pushAudio(pcmFrame());
+  assert.equal(socket.frames('audio.frame').length, 0, 'the ended session accepts no audio');
+
+  socket.deliver({ t: 'status', status: 'listening' });
+  assert.equal(service.getStatus(), 'ended');
+  socket.deliver({ t: 'status', status: 'ended' });
+  assert.equal(service.getStatus(), 'ended');
+
+  socket.remoteClose();
+  const recap = await service.stop();
+  assert.equal(recap.id, 'server-recap', 'the recap the backend already sent is still shown');
+  assert.equal(
+    events.filter((event) => event.type === 'ERROR').length,
+    0,
+    'a backend-initiated end is not a connection failure'
+  );
+});
+
+test('only an explicitly started new session clears the terminal guard', async () => {
+  const { service, socket } = startSession();
+
+  await (async () => {
+    const stopping = service.stop();
+    socket.deliver({ t: 'recap', recap: SERVER_RECAP });
+    await stopping;
+  })();
+  assert.equal(service.getStatus(), 'ended');
+
+  // A new session on the same service: the guard is lifted for it alone.
+  service.start(GOAL);
+  const next = FakeSocket.instances.at(-1);
+  assert.notEqual(next, socket);
+  next.accept();
+  assert.equal(service.getStatus(), 'listening');
+
+  service.pushAudio(pcmFrame());
+  assert.equal(next.frames('audio.frame').length, 1, 'the new session captures normally');
 });
 
 test('ending without a recap falls back to what actually arrived', async () => {

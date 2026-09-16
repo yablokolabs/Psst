@@ -16,6 +16,14 @@
  * audio is sent while the recap is still on its way. The socket stays open only
  * to receive that recap.
  *
+ * Ending is also irreversible within a session. `stop()` latches a terminal
+ * lifecycle flag, and from then on no message from the backend — a delayed
+ * `status: listening` or a resume acknowledgement that crossed the stop frame on
+ * the wire — can put the session back into a live state or reopen the audio
+ * path. Only an explicit `start()` clears the flag, which is a new session by
+ * definition. Terminal statuses (`ended`, `error`) still come through, so the UI
+ * always learns that the session is over.
+ *
  * It fails soft: an unreachable or misconfigured backend produces an ERROR event
  * (and an honest recap), never a crash.
  */
@@ -102,6 +110,11 @@ export class RealtimeConversationService implements ConversationService {
   private droppedStaleCues = 0;
   /** Monotonic counter for audio frames; the backend uses it for diagnostics. */
   private audioSeq = 0;
+  /**
+   * Latched by `stop()`/`dispose()`: the session cannot listen or send audio
+   * again. Delayed backend messages must never clear it — only `start()` does.
+   */
+  private terminal = false;
 
   constructor(sessionId: string = createSessionId()) {
     this.sessionId = sessionId;
@@ -121,6 +134,8 @@ export class RealtimeConversationService implements ConversationService {
   start(goal: ConversationGoal): void {
     this.teardownSocket();
 
+    // A new session is the only thing that unlocks the audio path.
+    this.terminal = false;
     this.goal = goal;
     this.entries = [];
     this.cues = [];
@@ -194,13 +209,13 @@ export class RealtimeConversationService implements ConversationService {
   }
 
   pause(): void {
-    if (this.status !== 'listening') return;
+    if (this.terminal || this.status !== 'listening') return;
     this.setStatus('paused');
     this.send({ t: 'session.pause' });
   }
 
   resume(): void {
-    if (this.status !== 'paused') return;
+    if (this.terminal || this.status !== 'paused') return;
     this.setStatus('listening');
     this.send({ t: 'session.resume' });
   }
@@ -214,7 +229,9 @@ export class RealtimeConversationService implements ConversationService {
    * sessions drop frames instead of accumulating a recording.
    */
   pushAudio(frame: MicrophoneFrame): void {
-    if (this.status !== 'listening' || !this.socketOpen) return;
+    // `terminal` is checked explicitly as well as the status: the guard is what
+    // blocks audio after End even if a stale status frame is still in flight.
+    if (this.terminal || this.status !== 'listening' || !this.socketOpen) return;
     if (frame.channels !== 1 || frame.encoding !== 'int16') return;
     if (frame.pcm.byteLength === 0 || frame.sampleRate <= 0) return;
 
@@ -250,6 +267,9 @@ export class RealtimeConversationService implements ConversationService {
     const canWaitForRecap =
       this.socketOpen && !this.serverEnded && this.status !== 'error' && this.status !== 'ended';
 
+    // Irreversible from here on: no backend message may restart this session.
+    this.terminal = true;
+
     // Leave `listening` immediately: this is what stops microphone capture and
     // blocks every further outgoing frame, before any asynchronous recap work.
     this.setStatus('ended');
@@ -272,6 +292,7 @@ export class RealtimeConversationService implements ConversationService {
 
   /** Releases the socket and timers. Called when the LIVE screen unmounts. */
   dispose(): void {
+    this.terminal = true;
     this.pendingRecap?.(null);
     this.pendingRecap = null;
     this.unclaimedRecap = null;
@@ -290,6 +311,11 @@ export class RealtimeConversationService implements ConversationService {
 
     switch (message.t) {
       case 'status':
+        // A live status arriving after End is a stale acknowledgement, not a
+        // new instruction: it must not restart capture or reopen the audio path.
+        // Terminal statuses still pass, so the UI hears about the end of the
+        // session (an audio-budget or duration end arrives this way).
+        if (this.terminal && LIVE_STATUSES.includes(message.status)) break;
         this.setStatus(message.status);
         break;
 
@@ -325,10 +351,16 @@ export class RealtimeConversationService implements ConversationService {
           this.settlePendingRecap(message.recap);
           break;
         }
-        // Nobody asked for it: the backend ended the session itself (idle or
-        // duration limit). Keep it, so ending from the app still shows it.
+        // Nobody asked for it: the backend ended the session itself (idle,
+        // duration or audio-budget limit). Keep it, so ending from the app still
+        // shows it, and treat the session as over: the backend will not accept
+        // more audio, so capture must not keep running while the socket closes.
         this.unclaimedRecap = message.recap;
         this.serverEnded = true;
+        this.terminal = true;
+        // The backend has already ended the session: report it now rather than
+        // waiting for the socket to close, so microphone capture stops promptly.
+        this.setStatus('ended');
         break;
       }
 

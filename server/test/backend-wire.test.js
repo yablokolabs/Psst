@@ -26,6 +26,30 @@ import {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Resolves with the handshake error message, or null when the socket opened. */
+function attemptConnection(url) {
+  return new Promise((resolve) => {
+    const socket = new WebSocket(url);
+    socket.on('error', (error) => resolve(error.message));
+    socket.on('open', () => {
+      socket.close();
+      resolve(null);
+    });
+  });
+}
+
+/** Waits for the server's own count to settle, since cleanup is asynchronous. */
+async function waitForActiveSessions(backend, expected) {
+  const deadline = Date.now() + 5000;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = (await backend.health()).activeSessions;
+    if (last === expected) return;
+    await sleep(50);
+  }
+  throw new Error(`activeSessions stayed at ${last}, expected ${expected}`);
+}
+
 /** Spawns a backend wired to a fresh fake provider. */
 async function harness(env = {}, providerOptions = {}) {
   const fake = await startFakeProvider(providerOptions);
@@ -217,6 +241,143 @@ test('concurrency is capped', async () => {
 
     assert.match(String(refusal), /503/, 'the second session must be refused');
     first.close();
+  } finally {
+    await close();
+  }
+});
+
+test('a duplicate live session id is refused instead of overwriting the first', async () => {
+  const { backend, close } = await harness({ PSST_MAX_SESSIONS: '4' });
+
+  try {
+    const first = await connectSession(backend.wsUrl('duplicate'));
+    await first.open();
+    first.send(startMessage());
+    await first.waitFor((message) => message.t === 'status' && message.status === 'listening');
+
+    // Same id, second connection: the slot is not a fresh one, so this is a
+    // conflict rather than an admission.
+    const refusal = await attemptConnection(backend.wsUrl('duplicate'));
+    assert.match(String(refusal), /409/, 'a duplicate id must be refused');
+    assert.equal((await backend.health()).activeSessions, 1, 'the duplicate never registered');
+
+    // The first connection is completely undisturbed by the refusal.
+    first.send({ t: 'session.pause' });
+    await first.waitFor((message) => message.t === 'status' && message.status === 'paused');
+    first.send({ t: 'session.resume' });
+    await first.waitFor((message) => message.t === 'status' && message.status === 'listening');
+
+    first.close();
+    await waitForActiveSessions(backend, 0);
+  } finally {
+    await close();
+  }
+});
+
+test('the cap counts live connections, frees one slot at a time, and never evicts', async () => {
+  const { backend, close } = await harness({ PSST_MAX_SESSIONS: '2' });
+
+  try {
+    const first = await connectSession(backend.wsUrl('one'));
+    await first.open();
+    first.send(startMessage());
+    await first.waitFor((message) => message.t === 'status' && message.status === 'listening');
+
+    const second = await connectSession(backend.wsUrl('two'));
+    await second.open();
+    second.send(startMessage());
+    await second.waitFor((message) => message.t === 'status' && message.status === 'listening');
+
+    assert.equal((await backend.health()).activeSessions, 2);
+
+    // At the cap, a new id is refused and the existing count is not inflated.
+    assert.match(String(await attemptConnection(backend.wsUrl('three'))), /503/);
+    assert.equal((await backend.health()).activeSessions, 2);
+
+    // Closing one frees exactly one slot, and must not remove the other
+    // connection's registration.
+    first.close();
+    await waitForActiveSessions(backend, 1);
+
+    second.send({ t: 'session.pause' });
+    await second.waitFor((message) => message.t === 'status' && message.status === 'paused');
+
+    // ...and the freed slot admits a new connection, including the refused id.
+    const third = await connectSession(backend.wsUrl('three'));
+    await third.open();
+    third.send(startMessage());
+    await third.waitFor((message) => message.t === 'status' && message.status === 'listening');
+    assert.equal((await backend.health()).activeSessions, 2);
+
+    third.close();
+    second.close();
+    await waitForActiveSessions(backend, 0);
+  } finally {
+    await close();
+  }
+});
+
+test('the audio budget ends the session visibly, then still delivers a recap', async () => {
+  const budget = 8192;
+  const { fake, backend, close } = await harness(
+    { PSST_MAX_SESSION_AUDIO_BYTES: String(budget) },
+    { replyToCommit: true, commitText: 'We should revisit the pricing next quarter.' }
+  );
+
+  try {
+    const client = await connectSession(backend.wsUrl('budget'));
+    await client.open();
+    client.send(startMessage());
+    await client.waitFor((message) => message.t === 'status' && message.status === 'listening');
+
+    const pcm = pcmSilence(64, 16000);
+    const frameBytes = pcm.byteLength;
+    assert.equal(frameBytes * 4, budget, 'the test budget must be exactly four frames');
+
+    let seq = 0;
+    const sendFrame = () => {
+      seq += 1;
+      client.send(audioFrame({ pcm, sampleRate: 16000, seq }));
+    };
+
+    for (let index = 0; index < 4; index += 1) sendFrame();
+    await waitFor(() => fake.audioChunks().length >= 4, { description: 'the accepted audio' });
+
+    // The next frame is over budget: the ceiling is announced, not silent.
+    sendFrame();
+    const noticesSeen = () =>
+      client.messages.filter((message) => message.t === 'notice' && /audio limit/.test(message.message));
+
+    const notice = await client.waitFor(
+      (message) => message.t === 'notice' && /audio limit/.test(message.message),
+      8000
+    );
+    assert.equal(notice.level, 'warning');
+    assert.match(notice.message, /and was ended/);
+
+    // Frames that keep arriving are dropped without repeating the explanation.
+    for (let index = 0; index < 20; index += 1) sendFrame();
+    await sleep(250);
+    assert.equal(noticesSeen().length, 1, 'exhaustion is explained exactly once');
+
+    // Clean termination: what was already accepted is flushed and the recap is
+    // honest about what happened.
+    const recapFrame = await client.waitFor((message) => message.t === 'recap', 12000);
+    assert.equal(recapFrame.recap.title, 'Budget call');
+    assert.ok(recapFrame.recap.summary.length > 0);
+    assert.ok(
+      recapFrame.recap.keyPoints.some((point) => point.includes('revisit the pricing')),
+      'audio already accepted must still make it into the recap'
+    );
+    await client.waitFor((message) => message.t === 'status' && message.status === 'ended', 8000);
+
+    assert.equal(backend.exited(), null, 'the backend survives the budget end');
+    const health = await backend.health();
+    assert.equal(health.audioBudgetEnds, 1);
+    assert.equal(health.limits.maxSessionAudioBytes, budget);
+
+    client.close();
+    await waitForActiveSessions(backend, 0);
   } finally {
     await close();
   }

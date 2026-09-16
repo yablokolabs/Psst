@@ -84,17 +84,31 @@ Limits (all optional; `/health` reports the effective values):
 | --- | --- | --- |
 | `PSST_MAX_PAYLOAD_BYTES` | 262144 | one WebSocket message |
 | `PSST_MAX_AUDIO_FRAME_BYTES` | 65536 | decoded PCM per `audio.frame` |
-| `PSST_MAX_SESSION_AUDIO_BYTES` | 100663296 | total audio accepted for one session |
+| `PSST_MAX_SESSION_AUDIO_BYTES` | 100663296 | total audio accepted for one session (96 MiB) |
 | `PSST_MAX_PROVIDER_QUEUE_BYTES` | 524288 | audio waiting for the provider socket |
 | `PSST_PROVIDER_QUEUE_MAX_AGE_MS` | 4000 | age of that queued audio |
 | `PSST_MAX_PROVIDER_BUFFERED_BYTES` | 524288 | unsent bytes on the provider socket before live audio is dropped |
-| `PSST_MAX_SESSIONS` | 64 | concurrent sessions (further upgrades get `503`) |
+| `PSST_MAX_SESSIONS` | 64 | concurrent live sessions (further upgrades get `503`; a duplicate live id gets `409`) |
 | `PSST_IDLE_TIMEOUT_MS` | 180000 | silence before a session is ended with an explanation |
 | `PSST_MAX_SESSION_DURATION_MS` | 3600000 | hard ceiling on one session |
 | `PSST_MAX_MESSAGES_PER_SEC` | 300 | audio frames per second (control frames are never throttled) |
 
 Set `PSST_MAX_PROVIDER_QUEUE_BYTES` above `PSST_MAX_AUDIO_FRAME_BYTES` (base64 is ~4/3 of the payload),
 or a single frame will not fit in the pre-open queue and everything will be dropped.
+
+The two session ceilings bound different things and either can be the one you hit:
+
+| Ceiling | Default | Reached after |
+| --- | --- | --- |
+| `PSST_MAX_SESSION_AUDIO_BYTES` | 96 MiB | ~17½ min of continuous 48 kHz mono PCM16 (~52 min at 16 kHz) |
+| `PSST_MAX_SESSION_DURATION_MS` | 60 min | 60 min of wall-clock session time |
+
+Whichever comes first ends the session **visibly**: one `notice` frame explains which ceiling was
+reached, the provider is flushed, and the recap is still delivered (`/health` counts these as
+`audioBudgetEnds` and `durationLimitEnds`). Audio frames sent after the ceiling are dropped without a
+second explanation. If you raise `PSST_MAX_SESSION_AUDIO_BYTES`, raise
+`PSST_MAX_SESSION_DURATION_MS` with it — otherwise the byte budget and the duration budget tell
+different stories about how long a session can last.
 
 Never expose either key to the client, never rename them to `EXPO_PUBLIC_*`, never log them and
 never return them from an endpoint.
@@ -125,6 +139,16 @@ Backend → client:
 
 `notice` is non-fatal (the session keeps running and the user is told what degraded); `error` is
 fatal. Both sides drop malformed or unknown frames rather than crashing a live conversation.
+
+Session ids are supplied by the client in the URL. Two live connections may never share one: the
+second upgrade for an id that is already streaming is refused with `409 Conflict` instead of silently
+replacing the first session (the concurrency cap answers `503`). A connection only ever removes its
+own registration when it closes.
+
+Parsing is total by construction: numeric fields (`seq`, `byteLength`, `audio.sampleRate`) are
+treated as numbers or numeric strings and nothing else. JSON such as
+`{"toString":null,"valueOf":null}` is valid input for `Number()`, which throws on it, so it is
+refused rather than converted.
 
 ## Audio path
 
@@ -165,6 +189,9 @@ implemented rather than silently ignored, and an unrecognised value falls back t
 - **Silence is a feature.** `decide()` has exactly two outcomes; most moments produce `NO_ACTION`.
 - **Suppression** drops duplicates, near-identical advice, low-confidence cues and anything inside
   the minimum interval.
+- **Pause is a boundary.** Pausing invalidates in-flight reasoning and clears queued work, so a cue
+  about speech from before the pause can never surface after the user resumes. Nothing is reasoned
+  about while paused, but the transcript is still recorded for the recap.
 - **Failure is `NO_ACTION`.** Missing key, timeout, HTTP error, invalid JSON or a malformed decision
   all degrade to silence. A recap is always produced from what was actually captured.
 
@@ -194,11 +221,14 @@ npm run providers -- --recap   # also exercise the model-written recap
 ```
 
 `npm test` runs `test/*.test.js` against a local fake STT endpoint — the same production code path,
-with no provider involved. It covers the malformed frame that used to take the process down, the
+with no provider involved. It covers the malformed frame that used to take the process down, numeric
+metadata carrying an object (`{"toString":null,"valueOf":null}`) that `Number()` throws on, the
 sample rate arriving at the provider unchanged (16 k/44.1 k/48 k through the real wire), survival of a
-disconnect during STT connection setup, final-utterance preservation through a stop, pending-final
-coalescing, stale-cue rejection, bounded audio buffering, and every limit above. From the repository
-root, `npm test` also runs the app-side transport tests in `test/client/`.
+disconnect during STT connection setup, final-utterance preservation through a stop, the pause
+boundary invalidating in-flight reasoning, pending-final coalescing, stale-cue rejection, duplicate
+and over-limit session ids with their cleanup, the audio budget ending a session visibly with an
+honest recap, bounded audio buffering, and every limit above. From the repository root, `npm test`
+also runs the app-side transport tests in `test/client/`.
 
 `provider-test.js` is a genuine end-to-end check of the server-side pipeline:
 

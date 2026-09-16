@@ -18,7 +18,7 @@
  * to count and, when it is actionable, explain to the user.
  */
 
-import { normalizeAudioConfig, validatePcmFrame } from './audio.js';
+import { normalizeAudioConfig, toFiniteNumber, validatePcmFrame } from './audio.js';
 import { LIMITS } from './limits.js';
 
 export const CLIENT_MESSAGE_TYPES = [
@@ -69,8 +69,10 @@ function normalizeGoal(goal) {
 }
 
 function readSampleRate(value) {
-  const rate = Number(value);
-  return Number.isFinite(rate) && rate > 0 ? rate : null;
+  // Primitive-only: `Number(value)` throws on `{"toString":null,"valueOf":null}`,
+  // which is valid JSON and would otherwise escape this function.
+  const rate = toFiniteNumber(value);
+  return rate !== null && rate > 0 ? rate : null;
 }
 
 function parseAudioFrame(data) {
@@ -98,7 +100,8 @@ function parseAudioFrame(data) {
 
   return {
     t: 'audio.frame',
-    seq: Number.isFinite(Number(data.seq)) ? Number(data.seq) : 0,
+    // Same guard: `seq` is client-controlled and only numbers count.
+    seq: toFiniteNumber(data.seq) ?? 0,
     pcm: data.pcm,
     /** What the device actually delivered, so nothing needs transcoding. */
     audio,

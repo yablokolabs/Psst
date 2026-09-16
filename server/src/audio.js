@@ -22,6 +22,32 @@ function isFinitePositive(value) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0;
 }
 
+/** A numeric string, matched literally so nothing is coerced through a method. */
+const NUMERIC_STRING = /^-?\d+(?:\.\d+)?$/;
+
+/**
+ * Converts one wire value to a finite number, using **primitives only**.
+ *
+ * `Number(value)` calls `valueOf`/`toString` on objects, and JSON happily
+ * carries `{"toString":null,"valueOf":null}` as a plain object. `Number()` on
+ * that throws `TypeError: Cannot convert object to primitive value`, which would
+ * escape the WebSocket message handler and take the whole backend down. So every
+ * field arriving from a client goes through this guard instead: numbers and
+ * numeric strings convert, everything else (objects, arrays, null, booleans,
+ * `NaN`, `Infinity`) is `null`.
+ *
+ * @param {unknown} value
+ * @returns {number | null}
+ */
+export function toFiniteNumber(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string' && NUMERIC_STRING.test(value)) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
 export function isSupportedSampleRate(sampleRate) {
   return SUPPORTED_SAMPLE_RATES.includes(sampleRate);
 }
@@ -96,8 +122,10 @@ export function validatePcmFrame(pcmBase64, declaredByteLength, maxBytes = LIMIT
   if (byteLength % 2 !== 0) return { ok: false, reason: 'unaligned-pcm', byteLength };
   if (byteLength > maxBytes) return { ok: false, reason: 'frame-too-large', byteLength };
 
-  const declared = Number(declaredByteLength);
-  if (Number.isFinite(declared) && declared > 0 && declared !== byteLength) {
+  // Primitive-only conversion: a declared length of `{"toString":null}` must
+  // read as "not declared" rather than throwing out of the parser.
+  const declared = toFiniteNumber(declaredByteLength);
+  if (declared !== null && declared > 0 && declared !== byteLength) {
     return { ok: false, reason: 'byte-length-mismatch', byteLength };
   }
 

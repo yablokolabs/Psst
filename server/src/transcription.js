@@ -18,7 +18,11 @@
  *
  * Staleness rule: a result that comes back after the session was paused,
  * stopped, detached or replaced is dropped before it can reach the UI. A cue is
- * only useful while the user is actually listening.
+ * only useful while the user is actually listening. Pausing is an explicit
+ * boundary: it invalidates in-flight reasoning and clears queued work, because a
+ * cue about speech from before a pause is worthless once the user resumes.
+ * Nothing is reasoned about while paused, and no cue is emitted while paused —
+ * the transcript itself is still kept, so the recap stays complete.
  *
  * Every failure path is non-fatal: a provider problem emits a notice frame and
  * the session keeps running (silently, if that is what reality dictates) rather
@@ -62,14 +66,14 @@ function sleep(ms) {
 }
 
 function inertAttachment() {
-  return { detach: () => {}, finalize: async () => false, commit: () => {} };
+  return { detach: () => {}, finalize: async () => false, commit: () => {}, pause: () => {} };
 }
 
 /**
  * @param {import('./session.js').ConversationSession} session
  * @param {(message: object) => void} emit protocol frame emitter
  * @param {{ provider?: object | null }} [options]
- * @returns {{ detach: () => void, finalize: () => Promise<boolean>, commit: () => void }}
+ * @returns {{ detach: () => void, finalize: () => Promise<boolean>, commit: () => void, pause: () => void }}
  */
 export function attachTranscription(session, emit, options = {}) {
   const provider = options.provider === undefined ? createReasoningProvider() : options.provider;
@@ -204,7 +208,9 @@ export function attachTranscription(session, emit, options = {}) {
     draining = true;
 
     try {
-      while (pendingFinal && !closed && !stopping) {
+      // `listening()` covers pause as well as stop/detach: nothing is evaluated
+      // while the user is not being listened to.
+      while (pendingFinal && listening()) {
         const { entry, queuedAt } = pendingFinal;
         pendingFinal = null;
 
@@ -255,6 +261,11 @@ export function attachTranscription(session, emit, options = {}) {
     // was said: it is kept for the recap, but the user has already ended the
     // session so it must not produce a cue.
     if (stopping) return;
+    // The same is true of a paused session. A pause commits what was heard (the
+    // transcript below is preserved for the recap), but reasoning must not start
+    // on it: the cue would arrive after the user resumed, about speech from
+    // before the pause.
+    if (session.status === 'paused') return;
     if (wordCount(trimmed) < REASONING_MIN_WORDS) return;
 
     pendingFinal = { entry, queuedAt: Date.now() };
@@ -344,6 +355,17 @@ export function attachTranscription(session, emit, options = {}) {
     commit: () => {
       if (closed || !manualCommit) return;
       void transcription.flush();
+    },
+
+    /**
+     * Pause boundary. Whatever the model is currently working on belongs to
+     * speech from before the pause, and whatever is queued is from then too, so
+     * both are invalidated here. Resuming starts from a clean slate: the next
+     * final after resume is reasoned about normally.
+     */
+    pause: () => {
+      epoch += 1;
+      pendingFinal = null;
     },
   };
 }

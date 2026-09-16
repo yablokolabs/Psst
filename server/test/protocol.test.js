@@ -13,7 +13,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { audioFormatForSampleRate, normalizeAudioConfig, validatePcmFrame } from '../src/audio.js';
+import {
+  audioFormatForSampleRate,
+  normalizeAudioConfig,
+  toFiniteNumber,
+  validatePcmFrame,
+} from '../src/audio.js';
 import { parseClientMessage } from '../src/protocol.js';
 import { audioFrame, pcmSilence } from './support/harness.js';
 
@@ -127,6 +132,121 @@ test('payload shape problems are rejected with a specific reason', () => {
     JSON.stringify({ t: 'audio.frame', pcm: pcmSilence(5000, 48000).toString('base64'), audio })
   );
   assert.equal(oversized.reason, 'frame-too-large');
+});
+
+/**
+ * Valid JSON whose `Number()` conversion throws:
+ * `TypeError: Cannot convert object to primitive value`.
+ *
+ * It is not exotic — it is two keystrokes of JSON — and it used to escape the
+ * WebSocket message handler and take the whole backend down.
+ */
+const POISON = { toString: null, valueOf: null };
+
+test('objects in numeric metadata are refused, never converted', () => {
+  const pcm = pcmSilence(100, 16000);
+  const base64 = pcm.toString('base64');
+  const audio = { sampleRate: 16000, channels: 1, encoding: 'int16' };
+
+  const cases = [
+    [
+      'seq',
+      { t: 'audio.frame', seq: POISON, pcm: base64, audio, byteLength: pcm.byteLength },
+      (parsed) => {
+        assert.equal(parsed.t, 'audio.frame');
+        assert.equal(parsed.seq, 0, 'an unusable seq falls back to 0');
+        assert.equal(parsed.byteLength, pcm.byteLength);
+      },
+    ],
+    [
+      'byteLength',
+      { t: 'audio.frame', pcm: base64, audio, byteLength: POISON },
+      (parsed) => {
+        assert.equal(parsed.t, 'audio.frame');
+        assert.equal(parsed.byteLength, pcm.byteLength, 'the decoded size stays authoritative');
+      },
+    ],
+    [
+      'audio.sampleRate',
+      { t: 'audio.frame', pcm: base64, audio: { ...audio, sampleRate: POISON }, byteLength: pcm.byteLength },
+      (parsed) => {
+        assert.equal(parsed.t, 'audio.frame.rejected');
+        assert.equal(parsed.reason, 'unsupported-audio-format');
+        assert.equal(parsed.reportedSampleRate, null, 'no rate is invented for an unusable one');
+      },
+    ],
+    [
+      'audio.channels',
+      { t: 'audio.frame', pcm: base64, audio: { ...audio, channels: POISON }, byteLength: pcm.byteLength },
+      (parsed) => {
+        assert.equal(parsed.t, 'audio.frame');
+        assert.equal(parsed.audio.channels, 1, 'a nonsense channel count means the mono feed STT needs');
+      },
+    ],
+    [
+      'the whole audio block',
+      { t: 'audio.frame', pcm: base64, audio: POISON, byteLength: pcm.byteLength },
+      (parsed) => {
+        assert.equal(parsed.t, 'audio.frame.rejected');
+        assert.equal(parsed.reportedSampleRate, null);
+      },
+    ],
+  ];
+
+  for (const [name, payload, check] of cases) {
+    let parsed;
+    assert.doesNotThrow(() => {
+      parsed = parseClientMessage(JSON.stringify(payload));
+    }, `${name} must not throw`);
+    assert.ok(parsed, `${name} must still produce a parse result`);
+    check(parsed);
+  }
+
+  // A well-formed frame is unaffected by the guard: the same session that just
+  // received nonsense keeps transcribing normally.
+  const valid = parseClientMessage(frame({ pcm, seq: 7 }));
+  assert.equal(valid.t, 'audio.frame');
+  assert.equal(valid.seq, 7);
+  assert.equal(valid.audio.sampleRate, 16000);
+  assert.equal(valid.byteLength, pcm.byteLength);
+});
+
+test('toFiniteNumber converts primitives only', () => {
+  assert.equal(toFiniteNumber(16000), 16000);
+  assert.equal(toFiniteNumber(0), 0);
+  assert.equal(toFiniteNumber(-3), -3);
+  assert.equal(toFiniteNumber('16000'), 16000);
+  assert.equal(toFiniteNumber('1.5'), 1.5);
+
+  for (const value of [
+    null,
+    undefined,
+    true,
+    [],
+    ['16000'],
+    {},
+    POISON,
+    { toString: () => '16000' },
+    '16000ms',
+    '',
+    NaN,
+    Infinity,
+    -Infinity,
+  ]) {
+    assert.equal(toFiniteNumber(value), null, `expected null for ${JSON.stringify(value)}`);
+  }
+});
+
+test('validatePcmFrame never converts an object through a method', () => {
+  const pcm = pcmSilence(20, 16000);
+
+  assert.doesNotThrow(() => validatePcmFrame(pcm.toString('base64'), POISON));
+  assert.deepEqual(validatePcmFrame(pcm.toString('base64'), POISON), {
+    ok: true,
+    byteLength: pcm.byteLength,
+  });
+  assert.doesNotThrow(() => validatePcmFrame(POISON, POISON));
+  assert.equal(validatePcmFrame(POISON, POISON).reason, 'missing-pcm');
 });
 
 test('validatePcmFrame accepts only well-formed PCM16', () => {

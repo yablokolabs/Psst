@@ -93,26 +93,34 @@ export class ConversationSession {
 
   /**
    * Forwards one microphone frame to the transcription pipeline.
+   *
    * Frames arriving while paused, or before STT is attached, are dropped and
    * counted rather than buffered: Psst never accumulates audio it is not
    * actively transcribing. A session also has a total-audio ceiling so one
-   * connection cannot stream forever.
+   * connection cannot stream forever; the caller is told when that ceiling is
+   * reached so it can end the session visibly instead of going quiet.
+   *
+   * @param {{ audio: object, byteLength: number } | null} frame
+   * @returns {'accepted' | 'dropped' | 'rejected' | 'limit-reached'}
    */
   pushAudioFrame(frame) {
     if (!frame || !frame.audio) {
       this.rejectedAudioFrames += 1;
-      return;
+      return 'rejected';
     }
     if (!this.audioSink || this.status !== 'listening') {
       this.droppedAudioFrames += 1;
-      return;
+      return 'dropped';
     }
 
     const bytes = frame.byteLength || 0;
     if (this.audioBytes + bytes > LIMITS.maxSessionAudioBytes) {
+      // Over budget. The caller ends the session, so this only ever reports the
+      // transition once; every frame after it is simply dropped and counted.
       this.droppedAudioFrames += 1;
+      const firstTime = !this.audioLimitReached;
       this.audioLimitReached = true;
-      return;
+      return firstTime ? 'limit-reached' : 'dropped';
     }
 
     this.audioFrames += 1;
@@ -122,6 +130,7 @@ export class ConversationSession {
     this.audioDurationMs += pcmDurationMs(bytes, frame.audio.sampleRate, frame.audio.channels);
 
     this.audioSink(frame);
+    return 'accepted';
   }
 
   get durationMs() {
