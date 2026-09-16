@@ -26,6 +26,29 @@
  * build or for a local check.
  */
 
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+/** scripts/preflight.mjs -> repository root. */
+const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+
+/**
+ * Loads the app's own `.env`, because only the Expo CLI does that automatically:
+ * a plain `npm run` script would otherwise see no `EXPO_PUBLIC_*` values at all.
+ * Real environment variables still win (`process.loadEnvFile` never replaces an
+ * existing variable), so an explicit export or `--url` always takes precedence.
+ */
+function loadLocalEnv() {
+  const file = path.join(REPO_ROOT, '.env');
+  if (!existsSync(file)) return;
+  try {
+    process.loadEnvFile(file);
+  } catch {
+    // A malformed .env is not fatal here: the checks below report what is missing.
+  }
+}
+
 const HEALTH_TIMEOUT_MS = 10000;
 const SOCKET_OPEN_TIMEOUT_MS = 10000;
 const LISTENING_TIMEOUT_MS = 10000;
@@ -181,6 +204,7 @@ function checkSession(socketUrl) {
 }
 
 async function main() {
+  loadLocalEnv();
   const args = readArgs(process.argv.slice(2));
   const baseUrl = (args.url.trim() || 'http://127.0.0.1:8787').replace(/\/+$/, '');
 

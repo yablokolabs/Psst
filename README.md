@@ -397,11 +397,23 @@ Notes:
 
 - The `preview` APK needs no Metro server: it is a release build with `expo-audio`'s native stream and
   RevenueCat compiled in, which is exactly what a realtime session requires.
-- The `development` profile **requires `expo-dev-client`**, which is not currently a dependency:
-  `npx expo install expo-dev-client` before using it. A dev-client build also needs Metro reachable
-  from the phone (same Wi-Fi with the VM's LAN IP, or `npx expo start --tunnel`), and the same
-  reachability applies to `EXPO_PUBLIC_PSST_BACKEND_URL` — `localhost` on the VM is not the phone.
-  A development build may use a plain `ws://` backend; a release build may not.
+- Which build for which job: the **`preview` APK** is the acceptance run — it is what ships. The
+  **`development` build** is the iteration tool: fix something during the run and reload instead of
+  waiting for another cloud build.
+- The `development` profile needs `expo-dev-client`, which is installed (`~57.0.19`, the SDK 57
+  version). One build, then iterate:
+
+  ```bash
+  npx eas-cli build --platform android --profile development
+  npx expo start --tunnel        # the phone cannot reach this VM's LAN IP
+  ```
+
+  Metro must be reachable from the phone, so use `--tunnel` (the first run offers to install
+  `@expo/ngrok`; answer yes). `EXPO_PUBLIC_*` values are inlined by Metro when it builds the bundle,
+  so a changed backend URL only needs a Metro restart — no new APK. A development build may use a
+  plain `ws://` backend; a release build may not.
+- `npm run preflight` reads the app's `.env`, so it checks the same URL a development build uses
+  (`npx expo` loads that file; a bare `npm run` does not, which is why the script loads it itself).
 - Server-side secrets live in **`server/.env`** (git-ignored, mode 600), never in the repository-root
   `.env`: the Expo CLI loads and exports that file for the app, so anything in it is bundle-adjacent.
   The root `.env` holds `EXPO_PUBLIC_*` values only. Both files are git-ignored; `.env.example` and
