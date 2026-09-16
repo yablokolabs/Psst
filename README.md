@@ -379,16 +379,23 @@ does not invent them:
 | Value | Where | Current |
 | --- | --- | --- |
 | `expo.extra.eas.projectId` | `app.json` | `07ca9f5c-…` (links the EAS project) |
+| `expo.slug` | `app.json` | `psst-app` (must match the linked EAS project) |
 | `expo.android.package` | `app.json` | `com.yablokolabs.psst` (permanent app identity) |
 
 `EXPO_PUBLIC_*` values are inlined **at build time**, so the backend URL must be provided to the
-build (an EAS environment variable), not only placed in a local `.env`:
+build, not only placed in a local `.env`. EAS build servers never read the local `.env`, and the
+`preview` profile selects the `preview` EAS environment (`"environment": "preview"` in `eas.json`),
+so the value has to exist in that environment:
 
 ```bash
 npx eas-cli login
-npx eas-cli env:create --name EXPO_PUBLIC_PSST_BACKEND_URL --value https://your-psst-backend.example.com --visibility plaintext --scope project
+npx eas-cli env:set --name EXPO_PUBLIC_PSST_BACKEND_URL --value https://your-psst-backend.example.com --environment preview --visibility plaintext
 npx eas-cli build --platform android --profile preview       # installable APK for the S24
 ```
+
+`expo.slug` must match the EAS project the `projectId` points at; if they disagree every EAS command
+fails with *"Slug for project identified by extra.eas.projectId … does not match the slug field"*.
+Change the slug to match the project, rather than creating a second project.
 
 The build prints a URL; open it on the phone, download the APK and allow "install unknown apps" for
 the browser once. No Metro server, no cable.
@@ -561,6 +568,8 @@ Run in this repository:
 | `npx tsc --noEmit` | clean |
 | `npx expo-doctor` | 21/21 |
 | `npx expo export --platform android` | bundle succeeds; scanning it finds **0** occurrences of either server-side key value and **0** of their names |
+| `npx eas-cli build --platform android --profile preview` | **APK built** (build `aed8bee1`, 113 MB, release, `com.yablokolabs.psst`); `EXPO_PUBLIC_PSST_BACKEND_URL` is present in `assets/index.android.bundle` |
+| APK secret scan | **0** matches in the APK for the `SARVAM_API_KEY`, `ELEVENLABS_API_KEY` or `EXPO_TOKEN` values |
 | `npm run server:providers` | previously recorded: 10 passed, 0 failed — real ElevenLabs STT, real Sarvam decision |
 | `npm run server:providers -- --recap` | adds the model-written recap; **recap coverage requires this flag** |
 
