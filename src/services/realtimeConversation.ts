@@ -1,5 +1,6 @@
 /**
- * RealtimeConversationService — Phase 2 engine, ready behind the same interface.
+ * RealtimeConversationService — the live engine, behind the same interface as
+ * the demo engine.
  *
  * Speaks the protocol in `src/types/realtime.ts` to the Psst backend, which is
  * the only place that ever touches ElevenLabs. It emits exactly the same events
@@ -10,6 +11,11 @@
  * `audio.frame`, transcript/cue/notice frames in. The backend owns every
  * provider integration, so no ElevenLabs or Sarvam detail exists here.
  *
+ * Stopping is deliberately synchronous in effect: the status leaves `listening`
+ * the moment `stop()` is called, so microphone capture stops and no further
+ * audio is sent while the recap is still on its way. The socket stays open only
+ * to receive that recap.
+ *
  * It fails soft: an unreachable or misconfigured backend produces an ERROR event
  * (and an honest recap), never a crash.
  */
@@ -18,7 +24,7 @@ import Constants from 'expo-constants';
 import { Platform } from 'react-native';
 
 import { AUDIO_FRAME_MAX_BYTES } from '@/constants/audio';
-import { buildRealtimeSocketUrl } from '@/services/backend';
+import { resolveRealtimeSocketTarget } from '@/services/backend';
 import type {
   ConversationEvent,
   ConversationGoal,
@@ -43,6 +49,15 @@ type Listener = (event: ConversationEvent) => void;
 const CONNECT_TIMEOUT_MS = 8000;
 /** How long to wait for the backend recap before falling back locally. */
 const STOP_TIMEOUT_MS = 12000;
+/**
+ * Unsent bytes tolerated on the socket before captured audio is dropped.
+ * A stalled connection must not turn into a growing backlog of stale audio:
+ * a cue about something said a minute ago is worthless.
+ */
+const MAX_SOCKET_BUFFER_BYTES = 512 * 1024;
+
+/** Statuses in which the session is expected to be usable. */
+const LIVE_STATUSES: ConversationStatus[] = ['connecting', 'listening', 'paused'];
 
 function createSessionId(): string {
   return `psst-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
@@ -63,6 +78,7 @@ function clientInfo(): RealtimeClientInfo {
 export class RealtimeConversationService implements ConversationService {
   readonly kind = 'realtime' as const;
 
+  private readonly sessionId: string;
   private listeners = new Set<Listener>();
   private socket: WebSocket | null = null;
   private socketOpen = false;
@@ -76,10 +92,20 @@ export class RealtimeConversationService implements ConversationService {
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private stopTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingRecap: ((recap: Recap | null) => void) | null = null;
+  /** A recap the backend sent without being asked (it ended the session itself). */
+  private unclaimedRecap: Recap | null = null;
+  /** True once the backend has ended the session on its own. */
+  private serverEnded = false;
+  private congestionReported = false;
+  private droppedAudioFrames = 0;
+  /** Cues that arrived after the session stopped listening. Diagnostics only. */
+  private droppedStaleCues = 0;
   /** Monotonic counter for audio frames; the backend uses it for diagnostics. */
   private audioSeq = 0;
 
-  constructor(private readonly sessionId: string = createSessionId()) {}
+  constructor(sessionId: string = createSessionId()) {
+    this.sessionId = sessionId;
+  }
 
   subscribe(listener: Listener): () => void {
     this.listeners.add(listener);
@@ -102,19 +128,22 @@ export class RealtimeConversationService implements ConversationService {
     this.accumulatedMs = 0;
     this.runStartedAt = null;
     this.startedAtIso = new Date().toISOString();
+    this.unclaimedRecap = null;
+    this.serverEnded = false;
+    this.congestionReported = false;
+    this.droppedAudioFrames = 0;
+    this.droppedStaleCues = 0;
     this.setStatus('connecting');
 
-    const url = buildRealtimeSocketUrl(this.sessionId);
-    if (!url) {
-      this.fail(
-        'Realtime sessions need EXPO_PUBLIC_PSST_BACKEND_URL. Add it and rebuild to stream audio.'
-      );
+    const target = resolveRealtimeSocketTarget(this.sessionId);
+    if ('error' in target) {
+      this.fail(target.error);
       return;
     }
 
     let socket: WebSocket;
     try {
-      socket = new WebSocket(url);
+      socket = new WebSocket(target.url);
     } catch (error) {
       this.fail(describe(error));
       return;
@@ -140,18 +169,27 @@ export class RealtimeConversationService implements ConversationService {
     };
 
     socket.onerror = () => {
-      if (this.status === 'connecting' || this.status === 'listening' || this.status === 'paused') {
+      if (!this.serverEnded && LIVE_STATUSES.includes(this.status)) {
         this.fail('The connection to the Psst backend was interrupted.');
       }
+      // The recap can no longer arrive: do not keep the user waiting for it.
+      this.settlePendingRecap(null);
     };
 
     socket.onclose = () => {
       this.clearConnectTimer();
       this.socketOpen = false;
       this.socket = null;
-      if (this.status === 'connecting' || this.status === 'listening' || this.status === 'paused') {
+      // A backend-initiated end is not a failure: it already sent its recap.
+      if (this.serverEnded) {
+        this.setStatus('ended');
+        this.settlePendingRecap(null);
+        return;
+      }
+      if (LIVE_STATUSES.includes(this.status)) {
         this.fail('The connection to the Psst backend closed.');
       }
+      this.settlePendingRecap(null);
     };
   }
 
@@ -180,6 +218,17 @@ export class RealtimeConversationService implements ConversationService {
     if (frame.channels !== 1 || frame.encoding !== 'int16') return;
     if (frame.pcm.byteLength === 0 || frame.sampleRate <= 0) return;
 
+    const socket = this.socket;
+    if (!socket) return;
+
+    // Congestion is explicit rather than silent: drop live audio, tell the user
+    // once, and never queue a backlog of audio that is no longer relevant.
+    if (typeof socket.bufferedAmount === 'number' && socket.bufferedAmount > MAX_SOCKET_BUFFER_BYTES) {
+      this.droppedAudioFrames += 1;
+      this.reportCongestion();
+      return;
+    }
+
     const audio = { sampleRate: frame.sampleRate, channels: 1, encoding: 'int16' as const };
 
     // An unusually large buffer is split so a single frame can never exceed what
@@ -197,27 +246,36 @@ export class RealtimeConversationService implements ConversationService {
   }
 
   async stop(): Promise<Recap> {
-    // Stop listening locally first so the clock freezes immediately.
     const durationMs = this.elapsed();
+    const canWaitForRecap =
+      this.socketOpen && !this.serverEnded && this.status !== 'error' && this.status !== 'ended';
 
-    if (this.socketOpen && this.status !== 'error') {
+    // Leave `listening` immediately: this is what stops microphone capture and
+    // blocks every further outgoing frame, before any asynchronous recap work.
+    this.setStatus('ended');
+
+    if (canWaitForRecap) {
       this.send({ t: 'session.stop' });
       const recap = await this.waitForRecap();
-      this.setStatus('ended');
       this.teardownSocket();
       if (recap) return recap;
+    } else {
+      this.teardownSocket();
     }
 
-    const fallback = this.buildLocalRecap(durationMs);
-    this.setStatus('ended');
-    this.teardownSocket();
-    return fallback;
+    const claimed = this.unclaimedRecap;
+    this.unclaimedRecap = null;
+    if (claimed) return claimed;
+
+    return this.buildLocalRecap(durationMs);
   }
 
   /** Releases the socket and timers. Called when the LIVE screen unmounts. */
   dispose(): void {
     this.pendingRecap?.(null);
     this.pendingRecap = null;
+    this.unclaimedRecap = null;
+    this.serverEnded = false;
     this.clearTimers();
     this.teardownSocket();
     this.listeners.clear();
@@ -251,15 +309,26 @@ export class RealtimeConversationService implements ConversationService {
       }
 
       case 'psst':
+        // A cue is only useful while Psst is actually listening. One produced
+        // before a pause/stop reached the server is dropped instead of popping
+        // onto a screen the user has already left.
+        if (this.status !== 'listening') {
+          this.droppedStaleCues += 1;
+          break;
+        }
         this.cues.push(message.cue);
         this.emit({ type: 'PSST', cue: message.cue });
         break;
 
       case 'recap': {
-        const resolve = this.pendingRecap;
-        this.pendingRecap = null;
-        this.clearStopTimer();
-        resolve?.(message.recap);
+        if (this.pendingRecap) {
+          this.settlePendingRecap(message.recap);
+          break;
+        }
+        // Nobody asked for it: the backend ended the session itself (idle or
+        // duration limit). Keep it, so ending from the app still shows it.
+        this.unclaimedRecap = message.recap;
+        this.serverEnded = true;
         break;
       }
 
@@ -283,6 +352,25 @@ export class RealtimeConversationService implements ConversationService {
       // A failed control frame is not worth interrupting the session for; the
       // socket onclose/onerror handlers report anything serious.
     }
+  }
+
+  private reportCongestion(): void {
+    if (this.congestionReported) return;
+    this.congestionReported = true;
+    this.emit({
+      type: 'NOTICE',
+      level: 'warning',
+      message:
+        'Your connection is too slow to stream audio continuously, so Psst dropped some audio. The transcript may have gaps and cues may be less accurate.',
+    });
+  }
+
+  /** Resolves an in-flight recap wait, from a recap frame or from a dead socket. */
+  private settlePendingRecap(recap: Recap | null): void {
+    const resolve = this.pendingRecap;
+    this.pendingRecap = null;
+    this.clearStopTimer();
+    resolve?.(recap);
   }
 
   private waitForRecap(): Promise<Recap | null> {

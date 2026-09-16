@@ -21,7 +21,7 @@
 import { openTranscriptionSession, isElevenLabsConfigured, getElevenLabsConfig } from '../src/elevenlabs.js';
 import { loadServerEnv } from '../src/env.js';
 import { buildRecap, createReasoningProvider, decide } from '../src/reasoning.js';
-import { getSarvamApiKey, getSarvamConfig, isSarvamConfigured } from '../src/sarvam.js';
+import { getSarvamConfig, isSarvamConfigured } from '../src/sarvam.js';
 import { ConversationSession } from '../src/session.js';
 import { normalizeAudioConfig } from '../src/audio.js';
 

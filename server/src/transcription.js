@@ -11,12 +11,21 @@
  * for reasoning, and even then only if the gate below says an evaluation is
  * warranted. That keeps cost, latency and noise down.
  *
+ * Scheduling rule: a final arriving while an evaluation is already running is
+ * **not** discarded. Pending work is coalesced to the most recent relevant final
+ * and evaluated as soon as the in-flight request finishes, so the last thing
+ * somebody said is always considered.
+ *
+ * Staleness rule: a result that comes back after the session was paused,
+ * stopped, detached or replaced is dropped before it can reach the UI. A cue is
+ * only useful while the user is actually listening.
+ *
  * Every failure path is non-fatal: a provider problem emits a notice frame and
  * the session keeps running (silently, if that is what reality dictates) rather
  * than dying.
  */
 
-import { openTranscriptionSession, isElevenLabsConfigured } from './elevenlabs.js';
+import { openTranscriptionSession, isElevenLabsConfigured, getElevenLabsConfig } from './elevenlabs.js';
 import { psstMessage, transcriptMessage, noticeMessage } from './protocol.js';
 import { OUTCOME, createReasoningProvider, decide } from './reasoning.js';
 
@@ -24,8 +33,11 @@ import { OUTCOME, createReasoningProvider, decide } from './reasoning.js';
 const REASONING_MIN_WORDS = 3;
 /** Floor between two reasoning calls, in case finals arrive back to back. */
 const REASONING_MIN_GAP_MS = 600;
-/** Grace period after stop, so a commit already in flight still lands. */
-const FINALIZE_GRACE_MS = 400;
+/**
+ * A final that has waited this long for the reasoning gate is no longer worth a
+ * cue: by then the conversation has moved on.
+ */
+const PENDING_FINAL_MAX_AGE_MS = 5000;
 
 const VALID_TONES = new Set(['opportunity', 'risk', 'question', 'signal']);
 
@@ -45,11 +57,19 @@ function pickTone(tone) {
   return typeof tone === 'string' && VALID_TONES.has(tone) ? tone : 'signal';
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function inertAttachment() {
+  return { detach: () => {}, finalize: async () => false, commit: () => {} };
+}
+
 /**
  * @param {import('./session.js').ConversationSession} session
  * @param {(message: object) => void} emit protocol frame emitter
  * @param {{ provider?: object | null }} [options]
- * @returns {{ detach: () => void, finalize: () => Promise<void> }}
+ * @returns {{ detach: () => void, finalize: () => Promise<boolean>, commit: () => void }}
  */
 export function attachTranscription(session, emit, options = {}) {
   const provider = options.provider === undefined ? createReasoningProvider() : options.provider;
@@ -61,20 +81,36 @@ export function attachTranscription(session, emit, options = {}) {
         'Realtime transcription is unavailable: the server has no ElevenLabs key configured. The session will stay silent.'
       )
     );
-    return { detach: () => {}, finalize: async () => {} };
+    return inertAttachment();
   }
+
+  const sttConfig = getElevenLabsConfig();
+  /** With `manual` commit there is no VAD, so the server commits at its own boundaries. */
+  const manualCommit = sttConfig.commitStrategy === 'manual';
 
   /** Segment counter: a partial and its commit share one transcript entry id. */
   let segment = 0;
   /** @type {string | null} */
   let partialId = null;
   let lastFinalText = '';
-  let reasoningInFlight = false;
+  /** Bumped whenever in-flight work stops being relevant (pause/stop/detach). */
+  let epoch = 0;
+  /** @type {{ entry: object, queuedAt: number } | null} */
+  let pendingFinal = null;
+  let draining = false;
   let lastReasoningAt = 0;
   let sttFailureReported = false;
+  let congestionReported = false;
+  let stopping = false;
   let closed = false;
 
   const makeEntryId = () => `${session.id}-line-${segment}`;
+
+  /** True while the session should still be producing cues. */
+  const listening = () => !closed && !stopping && session.status === 'listening';
+
+  /** True when a result produced now is still worth showing. */
+  const stillRelevant = (myEpoch) => listening() && myEpoch === epoch;
 
   const handleSttError = (message) => {
     session.transcriptionState = 'failed';
@@ -91,7 +127,7 @@ export function attachTranscription(session, emit, options = {}) {
   };
 
   const handlePartial = (text) => {
-    if (closed || session.status === 'paused') return;
+    if (closed || stopping || session.status === 'paused') return;
 
     if (partialId === null) partialId = makeEntryId();
 
@@ -107,8 +143,7 @@ export function attachTranscription(session, emit, options = {}) {
     emit(transcriptMessage(entry));
   };
 
-  const runReasoning = async (entry) => {
-    reasoningInFlight = true;
+  const runReasoning = async (entry, myEpoch) => {
     lastReasoningAt = Date.now();
     session.reasoningCalls += 1;
 
@@ -123,6 +158,9 @@ export function attachTranscription(session, emit, options = {}) {
         },
         { provider }
       );
+
+      // The session moved on while the model was thinking: this cue is stale.
+      if (!stillRelevant(myEpoch)) return;
 
       if (result.outcome !== OUTCOME.PSST || !result.cue) {
         if (result.error) {
@@ -153,8 +191,39 @@ export function attachTranscription(session, emit, options = {}) {
     } catch (error) {
       session.reasoningFailures += 1;
       console.warn(`[psst] reasoning failed, staying silent: ${describe(error)}`);
+    }
+  };
+
+  /**
+   * Evaluates pending finals one at a time, always picking up the most recent
+   * one. This is what keeps a final that arrived while reasoning was busy from
+   * being lost.
+   */
+  const drainReasoning = async () => {
+    if (draining) return;
+    draining = true;
+
+    try {
+      while (pendingFinal && !closed && !stopping) {
+        const { entry, queuedAt } = pendingFinal;
+        pendingFinal = null;
+
+        // Already superseded by newer speech, or too old to be worth a cue.
+        if (Date.now() - queuedAt > PENDING_FINAL_MAX_AGE_MS) continue;
+
+        const waitMs = REASONING_MIN_GAP_MS - (Date.now() - lastReasoningAt);
+        if (waitMs > 0) {
+          await sleep(waitMs);
+          // A newer final arrived while we waited: evaluate that one instead.
+          if (pendingFinal) continue;
+          if (!listening()) break;
+        }
+
+        const myEpoch = epoch;
+        await runReasoning(entry, myEpoch);
+      }
     } finally {
-      reasoningInFlight = false;
+      draining = false;
     }
   };
 
@@ -182,12 +251,14 @@ export function attachTranscription(session, emit, options = {}) {
     session.addTranscriptEntry(entry);
     emit(transcriptMessage(entry));
 
-    // Gate: is a reasoning evaluation warranted for this utterance at all?
-    if (reasoningInFlight) return;
+    // A final that arrives while the session is ending is the last thing that
+    // was said: it is kept for the recap, but the user has already ended the
+    // session so it must not produce a cue.
+    if (stopping) return;
     if (wordCount(trimmed) < REASONING_MIN_WORDS) return;
-    if (Date.now() - lastReasoningAt < REASONING_MIN_GAP_MS) return;
 
-    void runReasoning(entry);
+    pendingFinal = { entry, queuedAt: Date.now() };
+    void drainReasoning();
   };
 
   let transcription;
@@ -196,6 +267,16 @@ export function attachTranscription(session, emit, options = {}) {
       onPartial: handlePartial,
       onFinal: handleFinal,
       onError: handleSttError,
+      onCongestion: () => {
+        if (congestionReported) return;
+        congestionReported = true;
+        emit(
+          noticeMessage(
+            'warning',
+            'Psst is dropping some audio because the transcription connection cannot keep up, so the transcript may have gaps.'
+          )
+        );
+      },
       onOpen: () => {
         session.transcriptionState = 'streaming';
       },
@@ -209,16 +290,22 @@ export function attachTranscription(session, emit, options = {}) {
         'Realtime transcription could not be started on the server, so this session will stay silent.'
       )
     );
-    return { detach: () => {}, finalize: async () => {} };
+    return inertAttachment();
   }
 
   session.transcriptionState = 'ready';
   session.audioSink = (frame) => {
-    transcription.sendAudio(frame.pcm, frame.sampleRate);
+    // The delivered rate lives on the validated audio block; `frame.sampleRate`
+    // does not exist on the wire and would silently fall back to 16 kHz.
+    if (!frame || !frame.audio) return;
+    transcription.sendAudio(frame.pcm, frame.audio.sampleRate);
   };
 
   const detach = () => {
     closed = true;
+    stopping = true;
+    epoch += 1;
+    pendingFinal = null;
     session.audioSink = null;
     try {
       transcription.close();
@@ -229,13 +316,34 @@ export function attachTranscription(session, emit, options = {}) {
 
   return {
     detach,
+
+    /**
+     * Ends transcription without ending the session's record of it: the provider
+     * is asked to commit what it has already received, the resulting final
+     * transcript is given a bounded window to arrive, and only then is the
+     * provider socket closed. The physical microphone is already off.
+     *
+     * @returns {Promise<boolean>} true when the provider committed a final utterance
+     */
     finalize: async () => {
-      if (closed) return;
-      // Give a commit that is already in flight a moment to arrive before the
-      // provider socket closes. We never synthesise a transcript for audio that
-      // was not committed by the provider.
-      await new Promise((resolve) => setTimeout(resolve, FINALIZE_GRACE_MS));
+      if (closed) return false;
+      stopping = true;
+      // Anything the model is still chewing on is no longer relevant.
+      epoch += 1;
+      pendingFinal = null;
+
+      const committed = await transcription.flush();
       detach();
+      return committed;
+    },
+
+    /**
+     * Boundary commit for `manual` commit strategy, where the provider never
+     * commits on its own. A no-op in the default VAD mode.
+     */
+    commit: () => {
+      if (closed || !manualCommit) return;
+      void transcription.flush();
     },
   };
 }

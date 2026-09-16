@@ -9,8 +9,12 @@
  * them to `onFrame`, and the conversation service owns the transport. That keeps
  * provider logic out of the LIVE screen and keeps the UI free of socket code.
  *
- * Capture runs only while `active` is true, so the microphone is live exactly
- * while the session is listening and never in the background.
+ * Capture runs only while the session is listening **and** the app is in the
+ * foreground. `enableBackgroundRecording: false` in `app.json` stops Android
+ * from recording while backgrounded, but it does not stop an in-flight
+ * `AudioStream`: the stream is closed explicitly here whenever the app leaves
+ * the foreground (Home, app switcher, lock screen), so the microphone is never
+ * held open by a screen the user cannot see.
  */
 
 import {
@@ -21,12 +25,13 @@ import {
   type AudioStreamBuffer,
 } from 'expo-audio';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AppState, type AppStateStatus } from 'react-native';
 
 import { MIC_CHANNELS, MIC_ENCODING, MIC_SAMPLE_RATE } from '@/constants/audio';
 import type { MicrophoneFrame } from '@/types/conversation';
 
 export type MicrophoneStatus =
-  /** Not capturing: no session, or the session is paused. */
+  /** Not capturing: no session, the session is paused, or the app is hidden. */
   | 'idle'
   /** Permission prompt in flight, or the native stream is starting. */
   | 'requesting'
@@ -65,6 +70,11 @@ export function useAudioCapture({ active, onFrame }: UseAudioCaptureOptions): Us
   const [starting, setStarting] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const [sampleRate, setSampleRate] = useState(MIC_SAMPLE_RATE);
+  /**
+   * Foreground state. Anything other than `active` means the user is not
+   * looking at the session, so Psst must not be listening.
+   */
+  const [appState, setAppState] = useState<AppStateStatus>(() => AppState.currentState);
 
   // The native stream holds its own callback, so this reads the latest rate
   // through a ref instead of re-registering a listener on every buffer.
@@ -106,6 +116,17 @@ export function useAudioCapture({ active, onFrame }: UseAudioCaptureOptions): Us
     onBuffer: handleBuffer,
   });
 
+  // Home, app switcher, lock screen and incoming calls all leave `active`.
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (next) => {
+      setAppState(next);
+    });
+    return () => subscription.remove();
+  }, []);
+
+  /** Single source of truth for whether the microphone may be open right now. */
+  const shouldCapture = active && appState === 'active';
+
   useEffect(() => {
     let cancelled = false;
 
@@ -117,8 +138,10 @@ export function useAudioCapture({ active, onFrame }: UseAudioCaptureOptions): Us
       }
     };
 
-    if (!active) {
-      // External system update only: the derived status below reflects it.
+    if (!shouldCapture) {
+      // Leaving the foreground, pausing or ending the session all land here, and
+      // the microphone is closed explicitly rather than left to the recording
+      // config.
       stopCapture();
       return;
     }
@@ -161,25 +184,28 @@ export function useAudioCapture({ active, onFrame }: UseAudioCaptureOptions): Us
       cancelled = true;
       stopCapture();
     };
-  }, [active, stream]);
+  }, [shouldCapture, stream]);
 
   // Status is derived from native state and the request lifecycle rather than
   // written from inside the effect, so there is a single source of truth.
   const status = useMemo<MicrophoneStatus>(() => {
+    // While the app is hidden, report the truth: nothing is being captured.
+    if (!shouldCapture) return 'idle';
     if (failure) return 'error';
     if (permission === 'denied') return 'denied';
     if (isStreaming) return 'capturing';
     if (starting) return 'requesting';
     return 'idle';
-  }, [failure, permission, isStreaming, starting]);
+  }, [shouldCapture, failure, permission, isStreaming, starting]);
 
   const error = useMemo(() => {
+    if (!shouldCapture) return null;
     if (failure) return failure;
     if (permission === 'denied') {
       return 'Psst needs microphone access to listen to the conversation.';
     }
     return null;
-  }, [failure, permission]);
+  }, [shouldCapture, failure, permission]);
 
   return { status, error, sampleRate, isCapturing: status === 'capturing' };
 }

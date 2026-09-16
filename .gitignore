@@ -31,8 +31,10 @@ yarn-error.*
 *.pem
 
 # local env files (never commit secrets)
+# `.env.*` covers every environment variant: .env.local, .env.development,
+# .env.production, .env.staging, … The example file is the only one tracked.
 .env
-.env*.local
+.env.*
 !.env.example
 
 # typescript

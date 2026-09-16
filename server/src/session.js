@@ -12,6 +12,7 @@
 
 import { pushRecentCue } from './cue.js';
 import { pcmDurationMs } from './audio.js';
+import { LIMITS } from './limits.js';
 
 export class ConversationSession {
   constructor({ id, goal = null, client = null }) {
@@ -33,7 +34,12 @@ export class ConversationSession {
     this.audioFrames = 0;
     this.audioBytes = 0;
     this.audioDurationMs = 0;
+    /** Frames dropped because the session was not listening (or had too much audio). */
     this.droppedAudioFrames = 0;
+    /** Frames the protocol layer refused before they reached the session. */
+    this.rejectedAudioFrames = 0;
+    /** True once this session has hit its total-audio ceiling. */
+    this.audioLimitReached = false;
     /** @type {{ sampleRate: number, channels: number, encoding: string, audioFormat: string } | null} */
     this.audioConfig = null;
 
@@ -89,18 +95,29 @@ export class ConversationSession {
    * Forwards one microphone frame to the transcription pipeline.
    * Frames arriving while paused, or before STT is attached, are dropped and
    * counted rather than buffered: Psst never accumulates audio it is not
-   * actively transcribing.
+   * actively transcribing. A session also has a total-audio ceiling so one
+   * connection cannot stream forever.
    */
   pushAudioFrame(frame) {
-    if (!this.audioSink || this.status !== 'listening' || !frame.audio) {
+    if (!frame || !frame.audio) {
+      this.rejectedAudioFrames += 1;
+      return;
+    }
+    if (!this.audioSink || this.status !== 'listening') {
       this.droppedAudioFrames += 1;
+      return;
+    }
+
+    const bytes = frame.byteLength || 0;
+    if (this.audioBytes + bytes > LIMITS.maxSessionAudioBytes) {
+      this.droppedAudioFrames += 1;
+      this.audioLimitReached = true;
       return;
     }
 
     this.audioFrames += 1;
     if (this.audioConfig === null) this.audioConfig = frame.audio;
 
-    const bytes = frame.byteLength || 0;
     this.audioBytes += bytes;
     this.audioDurationMs += pcmDurationMs(bytes, frame.audio.sampleRate, frame.audio.channels);
 

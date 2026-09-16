@@ -305,9 +305,13 @@ export default function LiveScreen() {
             <Text style={styles.emptyTitle}>
               {status === 'connecting'
                 ? 'Connecting to Psst…'
-                : isRealtime && capture.isCapturing
-                  ? 'Listening to the room.'
-                  : 'Listening in the background.'}
+                : status === 'ended'
+                  ? 'Session ended. Preparing your recap…'
+                  : capture.isCapturing
+                    ? 'Listening to the room.'
+                    : isRealtime
+                      ? 'Waiting for the microphone.'
+                      : 'Listening in the demo.'}
             </Text>
             <Text style={styles.emptyBody}>
               {isRealtime

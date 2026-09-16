@@ -28,6 +28,7 @@ Phase 2b: the real microphone → realtime transcription → reasoning → cue p
 | ElevenLabs realtime STT | implemented and **tested server-side** with synthesised speech |
 | Sarvam cue reasoning (`NO_ACTION` / `PSST`) | implemented and **tested server-side** against the live API |
 | Cue suppression, honest recap fallback | implemented and tested server-side |
+| Stop/interruption, sample-rate and provider-flush handling | implemented; covered by offline regression tests (`npm test`) |
 | On-device test on a Galaxy S24 Ultra | **not yet performed** |
 
 Where a claim has not been verified on a device, this README says so. See
@@ -176,10 +177,15 @@ recording.
 
 If a device delivers a different rate (44.1/48 kHz), that rate is forwarded **unchanged** and the
 backend selects the matching provider format — there is no transcoding anywhere in the pipeline,
-and no audio is ever written to disk.
+and no audio is ever written to disk. A rate the provider does not accept (anything outside
+`pcm_8000/16000/22050/24000/44100/48000`) is **rejected with an explanation** rather than relabelled
+as a nearby rate, because mislabelled audio would transcribe a pitch-shifted conversation.
 
 The microphone is opened only while `status === 'listening'`: paused, connecting and ended sessions
-send nothing.
+send nothing. Tapping **End** leaves `listening` immediately — before any recap work — so capture and
+outgoing audio stop at once while the recap is still being fetched. Capture is also closed
+explicitly whenever the app leaves the foreground (Home, app switcher, lock screen);
+`enableBackgroundRecording: false` alone does not stop an in-flight `AudioStream`.
 
 ### Development build required
 
@@ -212,8 +218,11 @@ Backend → app:
 { "t": "error", "message": "…" }
 ```
 
-Malformed or unknown frames are dropped on **both** sides rather than crashing a live
-conversation.
+Malformed or unknown frames are dropped on **both** sides rather than crashing a live conversation,
+and a malformed `audio.frame` is rejected without ending the server process. Audio metadata is
+validated against the decoded bytes (a frame that declares a size it does not have is refused), and
+the backend caps payload size, per-frame audio, total session audio, provider queue bytes and age,
+concurrent sessions, idle time, session duration and audio-frame rate.
 
 ---
 
@@ -235,7 +244,9 @@ Useful root commands:
 | `npm run server:dev` | run the backend with reload |
 | `npm run server:start` | run the backend once |
 | `npm run server:smoke` | offline protocol smoke test — no provider credit used |
+| `npm test` | offline regression suite: backend units + app transport (`npm run test:server`, `npm run test:client`) |
 | `npm run server:providers` | **real** provider test: ElevenLabs STT + Sarvam reasoning |
+| `npm run server:providers -- --recap` | the same test **including** the model-written recap |
 
 Checks:
 
@@ -246,7 +257,9 @@ npx expo-doctor    # project health checks
 npx expo export --platform android   # production bundle
 ```
 
-`expo-env.d.ts`, `.expo/types`, `dist/`, `node_modules/` and every `.env` are git-ignored.
+`expo-env.d.ts`, `.expo/types`, `dist/`, `node_modules/` and every `.env` variant (`.env`,
+`.env.local`, `.env.production`, …) are git-ignored. `git ls-files` contains no environment file
+except the two `.env.example` templates.
 
 ---
 
@@ -270,12 +283,22 @@ SARVAM_API_KEY=server_only_secret
 | --- | --- | --- |
 | `EXPO_PUBLIC_REVENUECAT_API_KEY` | Public (ships in the bundle) | RevenueCat SDK in the app |
 | `EXPO_PUBLIC_PSST_BACKEND_URL` | Public | App → backend realtime connection |
-| `EXPO_PUBLIC_PSST_BACKEND_TOKEN` | Public | Only when the backend sets `PSST_CLIENT_TOKEN` |
+| `EXPO_PUBLIC_PSST_BACKEND_TOKEN` | Public | Only when the backend sets `PSST_CLIENT_TOKEN`. A shared token, **not** authentication |
 | `EXPO_PUBLIC_PSST_MODE` | Public | Optional engine pin (`realtime`/`mock`) |
 | `ELEVENLABS_API_KEY` | **Server-side secret** | `server/src/elevenlabs.js` only |
 | `SARVAM_API_KEY` | **Server-side secret** | `server/src/sarvam.js` only |
 
-### Security rules
+### Security and trust model
+
+`EXPO_PUBLIC_PSST_BACKEND_TOKEN` is a **shared token, not authentication**. It is inlined into the app
+bundle by definition, so anyone who has the APK has the token: it gates casual access to a test
+backend and nothing more. Real authorization — verifying the caller's Psst Pro entitlement server-side
+(RevenueCat webhook or REST API) plus per-user rate limiting — is a **public-release gate** and is not
+implemented yet. Until then the backend should only be exposed to testers, and it stays reachable
+under its own limits (see `server/README.md`).
+
+Transport is enforced rather than assumed: a release build refuses a non-TLS backend URL instead of
+opening an insecure `ws://` connection (see `src/services/backend.ts`).
 
 - **Never** access `ELEVENLABS_API_KEY` or `SARVAM_API_KEY` from React Native client code.
 - **Never** create `EXPO_PUBLIC_ELEVENLABS_API_KEY` or `EXPO_PUBLIC_SARVAM_API_KEY`.
@@ -302,6 +325,14 @@ unavailable` instead of throwing, and no prices are hardcoded.
 
 ---
 
+## Backend limits
+
+The backend bounds everything a client could grow without limit, all overridable by environment
+variable: WebSocket payload size, per-frame audio size, total audio per session, provider queue bytes
+and age, concurrent sessions, idle timeout, session duration and audio frames per second. Control
+frames (pause/resume/stop) are never throttled, so a session can always be ended. `GET /health`
+reports the effective numbers. The full table lives in `server/README.md`.
+
 ## Expo Go limitations
 
 - **RevenueCat** needs native code: in Expo Go the app reports "Purchases aren't available here",
@@ -316,33 +347,53 @@ unavailable` instead of throwing, and no prices are hardcoded.
 Android is the initial shipping platform (Samsung Galaxy S24 Ultra target). Builds are produced with
 EAS from this Ubuntu Azure VM — no local Android Studio required.
 
+`eas.json` at the repository root defines three profiles:
+
+| Profile | Output | Purpose |
+| --- | --- | --- |
+| `development` | APK with `expo-dev-client` | iterative work against a Metro server |
+| `preview` | **installable APK** | the S24 acceptance run (`distribution: internal`) |
+| `production` | AAB | store release |
+
+`eas.json` deliberately contains **no project ID and no `android.package`**: those identify *your*
+app store listing, so they must be chosen by the project owner rather than invented here. Set the
+package once (`npx eas-cli init` links the project, or add `expo.android.package` to `app.json`),
+then builds are reproducible from this file.
+
 `EXPO_PUBLIC_*` values are inlined **at build time**, so the backend URL must be provided to the
 build (an EAS environment variable), not only placed in a local `.env`:
 
 ```bash
 npx eas-cli login
-npx eas-cli build:configure
+npx eas-cli init                                    # links a project ID (or set it yourself)
 npx eas-cli env:create --name EXPO_PUBLIC_PSST_BACKEND_URL --value https://your-psst-backend.example.com --visibility plaintext --scope project
-npx eas-cli build --platform android --profile development   # dev client with native modules
-npx eas-cli build --platform android --profile preview       # installable APK for testing
+npx eas-cli build --platform android --profile preview       # installable APK for the S24
 ```
 
 Notes:
 
+- The `preview` APK needs no Metro server: it is a release build with `expo-audio`'s native stream and
+  RevenueCat compiled in, which is exactly what a realtime session requires.
+- The `development` profile **requires `expo-dev-client`**, which is not currently a dependency:
+  `npx expo install expo-dev-client` before using it. A dev-client build also needs Metro reachable
+  from the phone (same Wi-Fi with the VM's LAN IP, or `npx expo start --tunnel`), and the same
+  reachability applies to `EXPO_PUBLIC_PSST_BACKEND_URL` — `localhost` on the VM is not the phone.
 - Put `ELEVENLABS_API_KEY` and `SARVAM_API_KEY` in the **backend service's** environment on the VM,
   never in an `EXPO_PUBLIC_*` variable.
 - `app.json` enables the microphone permission and deliberately leaves **background recording off**:
-  Psst only listens during a session you started and can see.
+  Psst only listens during a session you started and can see. The app also closes the microphone
+  itself when it leaves the foreground.
 
 ---
 
 ## Testing on a Samsung Galaxy S24 Ultra
 
-Prerequisites: the backend reachable from the phone over TLS (`wss://` — a plain
-`EXPO_PUBLIC_PSST_BACKEND_URL` is upgraded to `wss://` by the app), and `EXPO_PUBLIC_PSST_BACKEND_URL`
-set for the build. `localhost` on the VM is not reachable from the phone.
+Prerequisites: `EXPO_PUBLIC_PSST_BACKEND_URL` set to an **`https://`** origin for the build, the
+backend reachable from the phone over TLS, and the certificate trusted by the phone. A release build
+refuses a plain-text backend URL instead of silently opening an insecure socket; only a development
+build may use `http://` on the local network. `localhost` on the VM is not reachable from the phone.
 
-1. Install the development or preview build on the phone.
+1. Build and install the **`preview`** APK (`npx eas-cli build --platform android --profile preview`).
 2. Open Psst → **Start a Psst**.
 3. Choose the **Sales** preset. Engine: **Live audio**.
 4. Goal: *"Understand the customer's budget before offering a discount."*
@@ -352,11 +403,25 @@ set for the build. `localhost` on the VM is not reachable from the phone.
 8. Your actual words must appear in the transcript as they are spoken.
 9. Within a few seconds, a real cue should appear, similar in intent to *(not hardcoded)*:
    `Psst… / They haven't revealed their budget. / Ask what range they expected.`
-10. Tap **Pause**: audio stops and the transcript stays. **Resume** continues the same session.
-11. Tap **End session** to get the recap.
+10. Tap **Pause**: the chip switches to `MIC OFF`, audio stops and the transcript stays. **Resume**
+    continues the same session.
+11. Say one clear last sentence, then tap **End session**. The mic must stop immediately (the chip
+    reads `MIC OFF`), and that final sentence must be in the recap.
 
 If step 8 fails, the LIVE screen shows the reason (a warning from the backend or a connection
 error) — it never substitutes demo transcript text.
+
+### S24 acceptance checklist
+
+| # | Check | Expected |
+| --- | --- | --- |
+| 1 | Tap **End** mid-sentence | microphone and outgoing audio stop at once; the recap still arrives |
+| 2 | Final sentence before **End** | it appears in the recap's key points |
+| 3 | **Pause** → speak → **Resume** | no audio, transcript or cue while paused; resume continues the same session |
+| 4 | Home/lock while listening | capture stops (chip `MIC OFF`); the session is not left running unseen |
+| 5 | Airplane mode mid-session | ONE clear failure notice, no silent demo fallback, honest recap still offered |
+| 6 | Real cue latency | a genuine cue appears within a few seconds of the trigger sentence |
+| 7 | `GET /health` on the VM | `elevenlabsConfigured`/`sarvamConfigured` true, limits listed, no key material |
 
 Backend-side checks while the phone is connected:
 
@@ -379,9 +444,14 @@ curl -s https://your-psst-backend.example.com/health | jq
   because a provider failed, and no cue is ever invented locally.
 - **Pause/resume** keeps the transcript and conversation state and does not recreate the provider
   session.
-- **On stop**, a commit already in flight is given a short grace period, the provider session is
-  closed cleanly, then the recap is generated. If the model recap fails or times out, the backend
-  returns a recap built from what was actually captured, and the app has its own fallback.
+- **A final arriving while an evaluation is running is coalesced**, not dropped: the latest relevant
+  utterance is evaluated as soon as the current request finishes. A result that comes back after a
+  pause, stop or detach is discarded before it can reach the screen.
+- **On stop**, the session stops accepting audio immediately, the provider is asked to commit with
+  the documented flush (an empty `input_audio_chunk` with `commit: true`), the final transcript is
+  given a bounded window to land, and only then is the provider socket closed — the microphone is
+  never kept open to force a commit. If the model recap fails or times out, the backend returns a
+  recap built from what was actually captured, and the app has its own fallback.
 
 ---
 
@@ -391,23 +461,36 @@ Run in this repository:
 
 | Check | Result |
 | --- | --- |
-| `npm run lint` | 0 errors, 0 warnings |
+| `npm test` | **59 passed, 0 failed** — 45 backend + 14 app transport, offline, no provider credit |
+| `npm run server:smoke` | passes (offline, no provider credit) |
+| `npm run lint` | 0 errors, 0 warnings (the backend and the test suites are linted as Node ESM now) |
 | `npx tsc --noEmit` | clean |
 | `npx expo-doctor` | 21/21 |
-| `npx expo export --platform android` | bundle succeeds |
-| `npm run server:smoke` | passes (offline, no provider credit) |
-| `npm run server:providers` | 10 passed, 0 failed — real ElevenLabs STT, real Sarvam decision + recap |
+| `npx expo export --platform android` | bundle succeeds; scanning it finds **0** occurrences of either server-side key value and **0** of their names |
+| `npm run server:providers` | previously recorded: 10 passed, 0 failed — real ElevenLabs STT, real Sarvam decision |
+| `npm run server:providers -- --recap` | adds the model-written recap; **recap coverage requires this flag** |
+
+`npm test` is the offline suite (Node's built-in runner). It drives the production code against a
+local fake STT endpoint and a fake socket, and covers the defects this phase fixed: a malformed
+`audio.frame` reaching the message handler, a sample rate arriving at the provider unchanged (16 k,
+44.1 k and 48 k, through the real wire), disconnect during STT connection setup, no microphone frames
+after Stop while the recap is delayed, final-utterance preservation through a stop, pending-final
+coalescing, stale-cue rejection, and bounded audio buffering. It never calls a provider and never
+needs a microphone.
 
 `server:providers` synthesises the acceptance sentence with ElevenLabs TTS, streams it through the
 production STT client and feeds the resulting real transcript to Sarvam. It asserts a cue for the
-price objection, `NO_ACTION` for small talk, suppression of a repeated cue, and a model-written
-recap. Measured results: real transcript *"We really like the product, but 2,000 dollars per month
-is above our budget."*, cues such as *"They stated their budget ceiling." / "Ask what their target
-range is."*, reasoning latency ≈ 2.8 s, recap ≈ 3.5 s.
+price objection, `NO_ACTION` for small talk and suppression of a repeated cue. Measured results:
+real transcript *"We really like the product, but 2,000 dollars per month is above our budget."*,
+cues such as *"They stated their budget ceiling." / "Ask what their target range is."*, reasoning
+latency ≈ 2.8 s, recap ≈ 3.5 s (with `-- --recap`). It was not re-run for this repair pass: it makes
+real, billable provider calls, and the offline suite now covers the same code paths structurally.
 
 **Not verified:** microphone capture and app → backend streaming from a physical device. This
-machine has no microphone, so real STT has only been proven server-side. Treat the on-device steps
-above as the remaining acceptance test.
+machine has no microphone, so real STT has only been proven server-side, and the microphone
+lifecycle (open, stop on End, stop when backgrounded) has only been proven by type/lint checks,
+offline tests of the transport gate and code inspection. Treat the on-device steps above as the
+remaining acceptance test.
 
 ---
 

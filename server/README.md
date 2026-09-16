@@ -22,6 +22,7 @@ app, never logged and never returned from an endpoint.
 src/
   index.js          HTTP + WebSocket server, /health, session routing, lifecycle
   env.js            Loads the shared repo-root .env (real env vars always win)
+  limits.js         Every server-side ceiling, env-overridable, reported by /health
   protocol.js       Wire protocol (mirrors src/types/realtime.ts in the app)
   session.js        In-memory session state: transcript, cues, clock, audio diagnostics
   audio.js          PCM format helpers (sample rate -> provider audio format)
@@ -34,6 +35,9 @@ src/
 scripts/
   smoke.js          Offline protocol test — no provider credit used
   provider-test.js  Real provider test: TTS -> STT -> transcript -> reasoning
+test/
+  *.test.js         Offline regression suite (node:test), fake STT endpoint
+  support/          Test harness: fake provider, spawned backend, protocol client
 ```
 
 ## Run it
@@ -49,8 +53,8 @@ environment variables always take precedence over any file.
 
 Endpoints:
 
-- `GET /health` — status. Reports configuration as **booleans and model names only**, plus session
-  counts. No key material, ever.
+- `GET /health` — status. Reports configuration as **booleans, model names and numbers only**, plus
+  session counts, drop/throttle counters and the effective limits. No key material, ever.
 - `WS /sessions/:id/stream` — the session channel used by the app.
 
 ## Environment variables
@@ -60,9 +64,12 @@ Endpoints:
 | `PORT` / `HOST` | no | Listen port (8787) and bind address (0.0.0.0). |
 | `PSST_CLIENT_TOKEN` | access token | When set, clients must connect with `?token=…`. Not a substitute for real auth. |
 | `ELEVENLABS_API_KEY` | **SERVER-SIDE SECRET** | Read by `src/elevenlabs.js` only. |
+| `ELEVENLABS_STT_ENDPOINT` | no | Realtime STT endpoint (default `wss://api.elevenlabs.io/…`). Also how the tests point the client at a local fake. |
 | `ELEVENLABS_STT_MODEL` | no | Realtime STT model (default `scribe_v2_realtime`). |
-| `ELEVENLABS_STT_COMMIT_STRATEGY` | no | `vad` (default, commits on silence) or `manual`. |
-| `ELEVENLABS_STT_LANGUAGE` | no | Optional ISO language hint to skip detection latency. |
+| `ELEVENLABS_STT_COMMIT_STRATEGY` | no | `vad` (default, commits on silence) or `manual`. Anything else falls back to `vad` and is reported by `/health`. |
+| `ELEVENLABS_STT_LANGUAGE` | no | Optional ISO 639-1/639-3 hint, sent as the `language_code` query parameter to skip detection latency. |
+| `PSST_STT_OPEN_TIMEOUT_MS` | no | Provider handshake budget before the stream is declared dead (default 10000). |
+| `PSST_STT_FLUSH_TIMEOUT_MS` | no | How long finalization waits for the commit it asked for (default 2500). |
 | `ELEVENLABS_STT_NO_VERBATIM` | no | Strip filler words (default `true`). |
 | `SARVAM_API_KEY` | **SERVER-SIDE SECRET** | Read by `src/sarvam.js` only. |
 | `SARVAM_MODEL` | no | Reasoning model (default `sarvam-105b-conversations`). |
@@ -70,6 +77,24 @@ Endpoints:
 | `SARVAM_TIMEOUT_MS` | no | Reasoning budget before falling back to `NO_ACTION` (default 8000). |
 | `PSST_MIN_CUE_INTERVAL_MS` | no | Minimum gap between cues (default 12000). |
 | `PSST_RECAP_TIMEOUT_MS` | no | Budget for the model-written recap (default 10000, below the app's 12 s wait). |
+
+Limits (all optional; `/health` reports the effective values):
+
+| Variable | Default | Bounds |
+| --- | --- | --- |
+| `PSST_MAX_PAYLOAD_BYTES` | 262144 | one WebSocket message |
+| `PSST_MAX_AUDIO_FRAME_BYTES` | 65536 | decoded PCM per `audio.frame` |
+| `PSST_MAX_SESSION_AUDIO_BYTES` | 100663296 | total audio accepted for one session |
+| `PSST_MAX_PROVIDER_QUEUE_BYTES` | 524288 | audio waiting for the provider socket |
+| `PSST_PROVIDER_QUEUE_MAX_AGE_MS` | 4000 | age of that queued audio |
+| `PSST_MAX_PROVIDER_BUFFERED_BYTES` | 524288 | unsent bytes on the provider socket before live audio is dropped |
+| `PSST_MAX_SESSIONS` | 64 | concurrent sessions (further upgrades get `503`) |
+| `PSST_IDLE_TIMEOUT_MS` | 180000 | silence before a session is ended with an explanation |
+| `PSST_MAX_SESSION_DURATION_MS` | 3600000 | hard ceiling on one session |
+| `PSST_MAX_MESSAGES_PER_SEC` | 300 | audio frames per second (control frames are never throttled) |
+
+Set `PSST_MAX_PROVIDER_QUEUE_BYTES` above `PSST_MAX_AUDIO_FRAME_BYTES` (base64 is ~4/3 of the payload),
+or a single frame will not fit in the pre-open queue and everything will be dropped.
 
 Never expose either key to the client, never rename them to `EXPO_PUBLIC_*`, never log them and
 never return them from an endpoint.
@@ -109,6 +134,29 @@ the device delivered. The provider audio format is derived from that rate
 STT session is attached, while paused, or with an unusable format are dropped and counted, never
 buffered — the backend does not accumulate audio it is not transcribing.
 
+A rate outside the endpoint's `AudioFormatEnum` (`pcm_8000`, `16000`, `22050`, `24000`, `44100`,
+`48000`) is **rejected** and explained to the app, never relabelled as a nearby rate. The frame's
+`byteLength` is verified against the decoded payload, so a frame that lies about its size is dropped
+rather than half-trusted.
+
+### Finalization (stop)
+
+When a session stops, the session object stops accepting audio immediately, then the provider is
+asked to commit with the endpoint's documented flush — `input_audio_chunk` with an empty
+`audio_base_64` and `commit: true` — and the resulting `committed_transcript` is given a bounded
+window (`PSST_STT_FLUSH_TIMEOUT_MS`) to arrive before the provider socket closes. That final
+utterance is recorded and appears in the recap; it is deliberately not reasoned about, because the
+user already ended the session. The physical microphone is off by then: nothing is synthesised or
+kept open to force a commit.
+
+### Commit strategy
+
+`vad` (default) lets ElevenLabs decide where an utterance ends, which is what produces live cues.
+`manual` disables that, so the only commits are the ones this server asks for: on **pause** and on
+**stop**. Manual mode therefore yields no cues during continuous speech — it is documented and
+implemented rather than silently ignored, and an unrecognised value falls back to `vad` with
+`elevenlabsCommitStrategyRejected: true` in `/health`.
+
 ## Reasoning rules
 
 - **Partials are display-only.** They never reach the model.
@@ -139,10 +187,18 @@ clamped to short, glanceable text — a model answering with a paragraph still y
 ## Tests
 
 ```bash
+npm test            # offline regression suite (node:test). No provider credit, no microphone.
 npm run smoke       # offline: lifecycle, malformed frames, /health, recap. No provider credit.
 npm run providers   # real calls. See below.
 npm run providers -- --recap   # also exercise the model-written recap
 ```
+
+`npm test` runs `test/*.test.js` against a local fake STT endpoint — the same production code path,
+with no provider involved. It covers the malformed frame that used to take the process down, the
+sample rate arriving at the provider unchanged (16 k/44.1 k/48 k through the real wire), survival of a
+disconnect during STT connection setup, final-utterance preservation through a stop, pending-final
+coalescing, stale-cue rejection, bounded audio buffering, and every limit above. From the repository
+root, `npm test` also runs the app-side transport tests in `test/client/`.
 
 `provider-test.js` is a genuine end-to-end check of the server-side pipeline:
 
@@ -173,15 +229,47 @@ Two field findings are baked into `sarvam.js` and worth keeping in mind:
 - **No database, no framework, no Kubernetes.** Sessions live in memory for the duration of a
   conversation; audio is never stored.
 - **No fake output.** If transcription is unavailable the session stays silent and says so.
+- **Total parsing.** The protocol layer runs on raw client input inside the WebSocket message
+  handler, so it returns a result for every input instead of throwing; a bad frame is dropped, and an
+  actionable one (an unsupported sample rate, an oversized frame) is explained once.
+- **Bounded by default.** Every dimension a client could grow — frame size, session audio, provider
+  queue bytes and age, concurrent sessions, idle time, session duration, frame rate — has a ceiling.
 
 ## Deploying on the Azure Ubuntu VM
 
-TLS is required (`wss://`) because the app streams microphone audio.
+### Prerequisites
+
+| Requirement | Why |
+| --- | --- |
+| **Node.js 22 or newer** | `package.json` declares `engines.node >= 22`; the code uses `process.loadEnvFile`, `AbortSignal.timeout` and the built-in `node:test` runner. `apt-get install nodejs npm` on older Ubuntu images gives an old Node — install 22 from NodeSource (or nvm) first. |
+| **A service user** | The unit below runs as `psst`. Create it, or change `User=` to an account that exists. |
+| **A deployment directory** | `/opt/psst` is the assumed checkout. The service user must own the code so it can read it, and must not need to write to it. |
+| **A DNS name + certificate** | The app only opens a TLS backend. Terminate TLS with nginx or Caddy (Caddy issues and renews Let's Encrypt certificates automatically). |
+| **WebSocket upgrade proxying** | `/sessions/…` must pass `Upgrade`/`Connection` headers through, or sessions fail at the handshake. |
+
+### Service setup
 
 ```bash
-# on the VM
-sudo apt-get install -y nodejs npm
-cd /opt/psst && sudo npm ci --omit=dev --prefix server
+# on the VM — Node 22 from NodeSource, then a dedicated service user
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs
+sudo useradd --system --home /opt/psst --shell /usr/sbin/nologin psst || true
+
+sudo mkdir -p /opt/psst && sudo chown -R psst:psst /opt/psst
+# place the repository at /opt/psst (git clone, rsync, …), then:
+sudo -u psst npm ci --omit=dev --prefix /opt/psst/server
+```
+
+Secrets live in a root-owned file the service can read, never in the unit itself:
+
+```bash
+sudo install -m 600 -o root -g psst /dev/null /etc/psst-backend.env
+sudo tee /etc/psst-backend.env >/dev/null <<'ENV'
+ELEVENLABS_API_KEY=replace-me
+SARVAM_API_KEY=replace-me
+# Optional: shared token. Public value, not authentication — see “Still to do”.
+# PSST_CLIENT_TOKEN=replace-me
+ENV
 
 sudo tee /etc/systemd/system/psst-backend.service >/dev/null <<'UNIT'
 [Unit]
@@ -189,30 +277,53 @@ Description=Psst realtime backend
 After=network.target
 
 [Service]
+User=psst
+Group=psst
 WorkingDirectory=/opt/psst/server
-EnvironmentFile=/etc/psst-backend.env     # chmod 600: ELEVENLABS_API_KEY, SARVAM_API_KEY
+# One directive per line: systemd does not support trailing '# comments'.
+EnvironmentFile=/etc/psst-backend.env
 ExecStart=/usr/bin/node src/index.js
 Restart=always
-User=psst
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
+sudo systemctl daemon-reload
 sudo systemctl enable --now psst-backend
+sudo journalctl -u psst-backend -n 50 --no-pager   # expect the limits line and 'configured' providers
 ```
 
-Put nginx or Caddy in front for TLS and proxy `/sessions/` with WebSocket upgrade headers. The app
-only needs the public origin:
+The backend reads its secrets **only** from the real environment and the loaded file; real environment
+variables always win (`src/env.js`), so a leftover development `.env` in the checkout cannot override
+the production `EnvironmentFile`.
+
+### TLS
+
+nginx needs the upgrade headers on the session path; Caddy does it by default:
+
+```caddy
+psst.example.com {
+    reverse_proxy 127.0.0.1:8787
+}
+```
+
+Verify from outside: `curl -s https://psst.example.com/health | jq`.
+
+The app only needs the public origin, as a build-time EAS environment variable (public, not a secret):
 
 ```bash
-# app build-time env (EAS environment variable, not a secret)
 EXPO_PUBLIC_PSST_BACKEND_URL=https://psst.example.com
 EXPO_PUBLIC_PSST_BACKEND_TOKEN=the-same-shared-token     # only if PSST_CLIENT_TOKEN is set
 ```
 
 ## Still to do
 
+0. **Public-release gate — real access control.** `PSST_CLIENT_TOKEN` is a shared token that ships
+   inside the app bundle, so it is a throttle, not authentication. Before this backend faces the
+   public, it needs verified identity (RevenueCat webhook or REST API), per-user rate limiting and
+   a retention decision for transcripts. Until then, keep it restricted to testers.
 1. Real access control: verify the caller's Psst Pro entitlement (RevenueCat webhook or REST API)
    instead of the shared `PSST_CLIENT_TOKEN`.
 2. Retention policy and logging review for transcripts held in memory.
