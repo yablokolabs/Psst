@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "Psst",
-    "slug": "Psst",
+    "slug": "psst-app",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -29,7 +29,9 @@
       [
         "expo-splash-screen",
         {
-          "backgroundColor": "#08070F"
+          "backgroundColor": "#08070F",
+          "image": "./assets/images/splash-icon.png",
+          "imageWidth": 200
         }
       ],
       [
