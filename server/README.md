@@ -21,7 +21,7 @@ app, never logged and never returned from an endpoint.
 ```
 src/
   index.js          HTTP + WebSocket server, /health, session routing, lifecycle
-  env.js            Loads the shared repo-root .env (real env vars always win)
+  env.js            Loads server/.env then the repo-root .env (real env vars always win)
   limits.js         Every server-side ceiling, env-overridable, reported by /health
   protocol.js       Wire protocol (mirrors src/types/realtime.ts in the app)
   session.js        In-memory session state: transcript, cues, clock, audio diagnostics
@@ -47,9 +47,13 @@ npm run server:install   # or: npm install
 npm run server:dev       # or: npm start, npm run smoke, npm run server:providers
 ```
 
-The backend reads the repository-root `../.env` automatically, so there is no need to duplicate
-secrets. For a standalone deployment, `server/.env` or `PSST_ENV_FILE` are also honoured, and real
-environment variables always take precedence over any file.
+The backend reads `server/.env` first and then falls back to the repository-root `../.env`;
+`PSST_ENV_FILE` overrides both, and real environment variables always take precedence over any file.
+
+Server-side provider keys belong in **`server/.env`** (git-ignored, mode 600). The repository-root
+`.env` exists for the app's `EXPO_PUBLIC_*` values — the Expo CLI loads and exports that file, so
+keeping `ELEVENLABS_API_KEY` / `SARVAM_API_KEY` out of it removes any chance of them reaching the
+bundle or a build log.
 
 Endpoints:
 

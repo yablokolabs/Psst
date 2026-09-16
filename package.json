@@ -51,7 +51,8 @@
     "server:dev": "npm --prefix server run dev",
     "server:start": "npm --prefix server start",
     "server:smoke": "npm --prefix server run smoke",
-    "server:providers": "npm --prefix server run providers"
+    "server:providers": "npm --prefix server run providers",
+    "preflight": "node scripts/preflight.mjs"
   },
   "private": true
 }

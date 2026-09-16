@@ -11,6 +11,7 @@
       "icon": "./assets/expo.icon"
     },
     "android": {
+      "package": "com.yablokolabs.psst",
       "adaptiveIcon": {
         "backgroundColor": "#08070F",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -45,6 +46,11 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "eas": {
+        "projectId": "07ca9f5c-9cc1-4545-981a-6f51b17165b3"
+      }
     }
   }
 }

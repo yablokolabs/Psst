@@ -373,20 +373,25 @@ EAS from this Ubuntu Azure VM — no local Android Studio required.
 | `preview` | **installable APK** | the S24 acceptance run (`distribution: internal`) |
 | `production` | AAB | store release |
 
-`eas.json` deliberately contains **no project ID and no `android.package`**: those identify *your*
-app store listing, so they must be chosen by the project owner rather than invented here. Set the
-package once (`npx eas-cli init` links the project, or add `expo.android.package` to `app.json`),
-then builds are reproducible from this file.
+`app.json` already carries the two values a build needs — the project owner chose them, this file
+does not invent them:
+
+| Value | Where | Current |
+| --- | --- | --- |
+| `expo.extra.eas.projectId` | `app.json` | `07ca9f5c-…` (links the EAS project) |
+| `expo.android.package` | `app.json` | `com.yablokolabs.psst` (permanent app identity) |
 
 `EXPO_PUBLIC_*` values are inlined **at build time**, so the backend URL must be provided to the
 build (an EAS environment variable), not only placed in a local `.env`:
 
 ```bash
 npx eas-cli login
-npx eas-cli init                                    # links a project ID (or set it yourself)
 npx eas-cli env:create --name EXPO_PUBLIC_PSST_BACKEND_URL --value https://your-psst-backend.example.com --visibility plaintext --scope project
 npx eas-cli build --platform android --profile preview       # installable APK for the S24
 ```
+
+The build prints a URL; open it on the phone, download the APK and allow "install unknown apps" for
+the browser once. No Metro server, no cable.
 
 Notes:
 
@@ -396,8 +401,11 @@ Notes:
   `npx expo install expo-dev-client` before using it. A dev-client build also needs Metro reachable
   from the phone (same Wi-Fi with the VM's LAN IP, or `npx expo start --tunnel`), and the same
   reachability applies to `EXPO_PUBLIC_PSST_BACKEND_URL` — `localhost` on the VM is not the phone.
-- Put `ELEVENLABS_API_KEY` and `SARVAM_API_KEY` in the **backend service's** environment on the VM,
-  never in an `EXPO_PUBLIC_*` variable.
+  A development build may use a plain `ws://` backend; a release build may not.
+- Server-side secrets live in **`server/.env`** (git-ignored, mode 600), never in the repository-root
+  `.env`: the Expo CLI loads and exports that file for the app, so anything in it is bundle-adjacent.
+  The root `.env` holds `EXPO_PUBLIC_*` values only. Both files are git-ignored; `.env.example` and
+  `server/.env.example` remain the templates.
 - `app.json` enables the microphone permission and deliberately leaves **background recording off**:
   Psst only listens during a session you started and can see. The app also closes the microphone
   itself when it leaves the foreground.
@@ -406,10 +414,57 @@ Notes:
 
 ## Testing on a Samsung Galaxy S24 Ultra
 
-Prerequisites: `EXPO_PUBLIC_PSST_BACKEND_URL` set to an **`https://`** origin for the build, the
-backend reachable from the phone over TLS, and the certificate trusted by the phone. A release build
-refuses a plain-text backend URL instead of silently opening an insecure socket; only a development
-build may use `http://` on the local network. `localhost` on the VM is not reachable from the phone.
+Prerequisites: `EXPO_PUBLIC_PSST_BACKEND_URL` set to an **`https://`** origin for the build, and a
+backend the phone can actually reach. A release build refuses a plain-text backend URL instead of
+silently opening an insecure socket; only a development build may use `http://` on the local
+network. `localhost` on the VM is not reachable from the phone.
+
+### Reaching the VM from the phone without a domain
+
+The VM sits behind Azure's firewall and has no certificate, so the fastest TLS path is an outbound
+tunnel — no domain, no certificate, no inbound firewall change:
+
+```bash
+# 1. Backend on the VM (binds 0.0.0.0:8787, reads keys from server/.env)
+npm run server:start
+
+# 2. Public https URL that forwards to it (quick tunnel needs no account)
+cloudflared tunnel --url http://127.0.0.1:8787 --no-autoupdate
+#  -> https://<random-words>.trycloudflare.com
+
+# 3. Prove the exact phone path works before touching the phone
+npm run preflight -- --url https://<random-words>.trycloudflare.com
+```
+
+`npm run preflight` checks `/health`, then opens a real session and drives it to a recap over that
+URL (`listening` → `session.stop` → `recap` → `ended`), printing timings. It sends no audio, so it
+opens no STT session and costs nothing. It exits non-zero on any failure, and it warns (rather than
+fails) when the URL is a private address that only a development build could use.
+
+The quick-tunnel hostname changes every time the tunnel restarts, and the URL is baked into the APK
+at build time: keep the tunnel running for the whole session, or rebuild the APK when it changes.
+
+### What to watch while the phone runs
+
+The backend logs the session lifecycle, so the machine side of every checklist row is visible:
+
+```bash
+curl -s http://127.0.0.1:8787/health | jq '{activeSessions, totalSessions, rejectedAudioFrames, throttledMessages, idleTimeouts, durationLimitEnds, audioBudgetEnds, handlerErrors}'
+tail -f /tmp/psst-backend.log     # start this before you tap Start listening
+```
+
+Sample where to capture the result for each row:
+
+| Row | Machine-side evidence |
+| --- | --- |
+| 1, 2 | transcript frames then `recap` with the final sentence in `keyPoints`; audio stops at the stop frame |
+| 3, 7 | `status: paused` / `listening` in the log; no `psst` frame while paused or for pre-pause speech |
+| 4 | the socket closes when the app leaves the foreground (`activeSessions` drops) |
+| 5 | a `notice`/error frame, no demo transcript, recap still returned |
+| 6 | time between the final transcript frame and the `psst` frame in the log |
+| 8, 8b | `notice` naming the limit, then `status: ended`, then exactly one `recap` |
+| 9 | the second connection's upgrade is refused (`409` for a duplicate id, `503` at the cap) |
+| 10 | the `/health` output above |
 
 1. Build and install the **`preview`** APK (`npx eas-cli build --platform android --profile preview`).
 2. Open Psst → **Start a Psst**.
