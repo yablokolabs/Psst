@@ -1,0 +1,30 @@
+# Cloudflare *named* tunnel for the test VM — a stable hostname that survives
+# restarts, unlike a quick tunnel (which gets a new random hostname every run).
+#
+# Install:
+#   cp deploy/cloudflared-config.yml ~/.cloudflared/config.yml
+#   sudo cp deploy/cloudflared.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now cloudflared
+#
+# Provenance (already done on this VM, recorded so it is reproducible):
+#   cloudflared tunnel login                 # authorizes the zone yablokolabs.com
+#   cloudflared tunnel create psst-backend   # -> id 16efbd82-808f-44bc-b036-99574f9e5346
+#   cloudflared tunnel route dns psst-backend psst.yablokolabs.com
+#
+# Public origin: https://psst.yablokolabs.com  (the app dials this as wss://)
+#
+# The credentials file holds the tunnel secret. It lives only in ~/.cloudflared
+# (mode 0400) and is never committed.
+
+tunnel: 16efbd82-808f-44bc-b036-99574f9e5346
+credentials-file: /home/azureuser/.cloudflared/16efbd82-808f-44bc-b036-99574f9e5346.json
+
+# Cloudflare edge needs no client-side tuning for this workload: the session
+# socket is a normal WebSocket upgrade and the backend already bounds payload
+# size, queue depth and session length (see server/src/limits.js).
+ingress:
+  # The origin is loopback-only (see psst-backend.service): this tunnel is the
+  # single ingress, so nothing needs to reach :8787 directly.
+  - hostname: psst.yablokolabs.com
+    service: http://127.0.0.1:8787
+  - service: http_status:404

@@ -65,7 +65,7 @@ Endpoints:
 
 | Variable | Secret? | Purpose |
 | --- | --- | --- |
-| `PORT` / `HOST` | no | Listen port (8787) and bind address (0.0.0.0). |
+| `PORT` / `HOST` | no | Listen port (8787) and bind address (default `0.0.0.0`). **Precedence note:** systemd reads `EnvironmentFile=` *after* `Environment=`, so a value in an env file beats one in the unit file — keep `HOST` in exactly one place. When a reverse proxy or tunnel fronts the backend (the normal deployment), set `HOST=127.0.0.1`: then nothing can reach `:8787` directly. |
 | `PSST_CLIENT_TOKEN` | access token | When set, clients must connect with `?token=…`. Not a substitute for real auth. |
 | `ELEVENLABS_API_KEY` | **SERVER-SIDE SECRET** | Read by `src/elevenlabs.js` only. |
 | `ELEVENLABS_STT_ENDPOINT` | no | Realtime STT endpoint (default `wss://api.elevenlabs.io/…`). Also how the tests point the client at a local fake. |

@@ -1,0 +1,39 @@
+# Cloudflare named tunnel lookup. Keeps https://psst.yablokolabs.com pointed at
+# the loopback-only backend and comes back automatically after a reboot.
+#
+# Install:
+#   sudo cp deploy/cloudflared.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now cloudflared
+#   journalctl -u cloudflared -f
+#
+# The config lives in a user-writable directory, so this unit deliberately runs
+# unprivileged: a tunnel that only dials 127.0.0.1 needs no root.
+
+[Unit]
+Description=Cloudflare Tunnel for psst.yablokolabs.com
+Documentation=file:/home/azureuser/Psst/deploy/cloudflared-config.yml
+After=network-online.target psst-backend.service
+# Ordering only: cloudflared reconnects to the edge on its own, so the tunnel
+# starting before the backend is survivable, just noisy in the journal.
+Wants=network-online.target
+
+[Service]
+# Type=simple on purpose: cloudflared runs in the foreground and Restart=always
+# covers a dropped edge connection. Type=notify would require sd_notify support,
+# and a unit that never sends READY=1 hangs for 90s and is killed at start.
+Type=simple
+User=azureuser
+Group=azureuser
+ExecStart=/home/azureuser/.local/bin/cloudflared --no-autoupdate --config /home/azureuser/.cloudflared/config.yml tunnel run
+
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cloudflared
+
+[Install]
+WantedBy=multi-user.target

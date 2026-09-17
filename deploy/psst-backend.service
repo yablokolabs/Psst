@@ -1,0 +1,55 @@
+# Psst realtime backend — *instance* unit for the Azure test VM.
+#
+# This unit runs the live checkout in place, as the interactive user, so a code
+# edit only needs `sudo systemctl restart psst-backend` to take effect.
+# `server/README.md` documents the hardened production variant instead
+# (/opt/psst, a dedicated `psst` service user, secrets in /etc/psst-backend.env).
+#
+# Install:
+#   sudo cp deploy/psst-backend.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now psst-backend
+#   journalctl -u psst-backend -f
+
+[Unit]
+Description=Psst realtime backend (test VM)
+Documentation=file:/home/azureuser/Psst/server/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=azureuser
+Group=azureuser
+WorkingDirectory=/home/azureuser/Psst/server
+
+# Provider keys and tuning live in this git-ignored file. The leading '-' keeps
+# the unit startable if the file is absent (the server then reports providers as
+# not configured rather than failing to boot).
+EnvironmentFile=-/home/azureuser/Psst/server/.env
+
+# NOTE ON PRECEDENCE — verified, not assumed: systemd reads EnvironmentFile=
+# *after* Environment=, so a HOST/PORT set in server/.env wins over any
+# Environment= line here. HOST/PORT therefore live in server/.env as the single
+# source of truth; duplicating them below would be a lie. Keep that file at
+# HOST=127.0.0.1 — loopback is correct now that the only ingress is the
+# Cloudflare tunnel, and nothing should reach :8787 directly.
+#
+# (server/src/env.js has the opposite precedence for the app's own .env loading:
+# a variable already present in the process environment wins there. Both paths
+# therefore agree on the loopback bind.)
+Environment=NODE_ENV=production
+
+ExecStart=/home/azureuser/.local/bin/node src/index.js
+
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=psst-backend
+
+[Install]
+WantedBy=multi-user.target

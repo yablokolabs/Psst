@@ -438,21 +438,40 @@ backend the phone can actually reach. A release build refuses a plain-text backe
 silently opening an insecure socket; only a development build may use `http://` on the local
 network. `localhost` on the VM is not reachable from the phone.
 
-### Reaching the VM from the phone without a domain
+### Reaching the VM from the phone
 
-The VM sits behind Azure's firewall and has no certificate, so the fastest TLS path is an outbound
-tunnel — no domain, no certificate, no inbound firewall change:
+The VM sits behind Azure's firewall and has no certificate of its own, so the phone reaches it
+through a **Cloudflare tunnel**: `cloudflared` dials *out* to Cloudflare's edge and holds that
+connection open, and Cloudflare publishes an ordinary TLS hostname on 443 that multiplexes back down
+it. No inbound firewall rule, no certificate to manage — and the backend itself only ever listens on
+**loopback**, because the tunnel is the single ingress.
+
+Both halves run under systemd, so they return by themselves after a reboot
+(`deploy/psst-backend.service`, `deploy/cloudflared.service`, `deploy/cloudflared-config.yml`):
 
 ```bash
-# 1. Backend on the VM (binds 0.0.0.0:8787, reads keys from server/.env)
-npm run server:start
+# Deploy the units (the files carry the full install notes)
+sudo cp deploy/psst-backend.service deploy/cloudflared.service /etc/systemd/system/
+cp deploy/cloudflared-config.yml ~/.cloudflared/config.yml
+sudo systemctl daemon-reload && sudo systemctl enable --now psst-backend cloudflared
 
-# 2. Public https URL that forwards to it (quick tunnel needs no account)
-cloudflared tunnel --url http://127.0.0.1:8787 --no-autoupdate
-#  -> https://<random-words>.trycloudflare.com
+# Operate them
+sudo systemctl status psst-backend cloudflared    # want: active + enabled on both
+journalctl -u psst-backend -f                     # backend log
+journalctl -u cloudflared  -f                     # tunnel log
+```
 
-# 3. Prove the exact phone path works before touching the phone
-npm run preflight -- --url https://<random-words>.trycloudflare.com
+Because the tunnel is a *named* one, the public origin is **stable across restarts** — so the URL
+baked into the APK stays valid:
+
+```
+https://psst.yablokolabs.com
+```
+
+Prove the exact path the phone will use before touching the phone:
+
+```bash
+npm run preflight             # reads EXPO_PUBLIC_PSST_BACKEND_URL from .env
 ```
 
 `npm run preflight` checks `/health`, then opens a real session and drives it to a recap over that
@@ -460,8 +479,12 @@ URL (`listening` → `session.stop` → `recap` → `ended`), printing timings. 
 opens no STT session and costs nothing. It exits non-zero on any failure, and it warns (rather than
 fails) when the URL is a private address that only a development build could use.
 
-The quick-tunnel hostname changes every time the tunnel restarts, and the URL is baked into the APK
-at build time: keep the tunnel running for the whole session, or rebuild the APK when it changes.
+#### Fallback: no domain to name a tunnel under
+
+`cloudflared tunnel --url http://127.0.0.1:8787 --no-autoupdate` needs no account and is fine for a
+one-off look, but its hostname is random words that **change on every restart**, and the URL is baked
+into the APK at build time. With a quick tunnel you must keep that process alive for the whole
+session or rebuild the APK whenever it comes back. Prefer the named tunnel above.
 
 ### What to watch while the phone runs
 
@@ -469,7 +492,7 @@ The backend logs the session lifecycle, so the machine side of every checklist r
 
 ```bash
 curl -s http://127.0.0.1:8787/health | jq '{activeSessions, totalSessions, rejectedAudioFrames, throttledMessages, idleTimeouts, durationLimitEnds, audioBudgetEnds, handlerErrors}'
-tail -f /tmp/psst-backend.log     # start this before you tap Start listening
+journalctl -u psst-backend -f     # start this before you tap Start listening
 ```
 
 Sample where to capture the result for each row:
