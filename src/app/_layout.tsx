@@ -1,8 +1,8 @@
 import { Stack } from 'expo-router';
 
 import { Palette } from '@/constants/theme';
+import { DebriefsProvider } from '@/hooks/use-debriefs';
 import { ProProvider } from '@/hooks/use-pro';
-import { SessionHistoryProvider } from '@/hooks/use-session-history';
 
 export const unstable_settings = {
   initialRouteName: 'index',
@@ -11,7 +11,7 @@ export const unstable_settings = {
 export default function RootLayout() {
   return (
     <ProProvider>
-      <SessionHistoryProvider>
+      <DebriefsProvider>
         <Stack
           screenOptions={{
             headerShown: false,
@@ -19,13 +19,12 @@ export default function RootLayout() {
             animation: 'slide_from_right',
           }}>
           <Stack.Screen name="index" />
-          <Stack.Screen name="prep" />
-          <Stack.Screen name="live" />
-          <Stack.Screen name="recap" />
+          <Stack.Screen name="import" />
+          <Stack.Screen name="debrief" />
           <Stack.Screen name="settings" />
           <Stack.Screen name="pro" />
         </Stack>
-      </SessionHistoryProvider>
+      </DebriefsProvider>
     </ProProvider>
   );
 }

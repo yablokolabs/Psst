@@ -1,34 +1,43 @@
 /**
- * Psst realtime backend.
+ * Psst backend.
  *
- * Responsibilities:
- *   - own the WebSocket session API the Psst app connects to
- *   - hold ELEVENLABS_API_KEY and SARVAM_API_KEY, server-side only
- *   - pipe microphone frames through realtime STT, then reasoning, then cues
- *   - build the recap when a session stops
+ * Two jobs, and only one of them is still used by the app:
  *
- * Pipeline:
- *   phone mic -> app -> audio.frame -> ElevenLabs realtime STT -> transcript
- *             -> committed utterance -> Sarvam reasoning -> NO_ACTION / PSST
- *             -> cue frame -> existing LIVE screen
+ *   1. Import analysis — the primary API. A recording the user chose is POSTed
+ *      to `/debrief`, transcribed in one batch call, and returned as a Debrief:
+ *      summary, decisions, commitments, follow-ups, people, risks, reminders.
+ *      Catch it here:
+ *        POST /debrief?token=…&callType=…&title=…&contact=…&durationMs=…
+ *        body: raw audio bytes (audio/*)
  *
- * No database, no framework. Sessions live in memory and an optional shared
- * client token gates access. That token is a throttle, not authentication: it
- * ships inside the app bundle (see `PSST_CLIENT_TOKEN` below), so real
- * authorization is a public-release gate, not something this server does yet.
+ *   2. The realtime WebSocket session API (`/sessions/{id}/stream`). Psst no
+ *      longer opens it — the app is import-first, and no app can capture a
+ *      phone call's audio — but the pipeline stays until its removal is a
+ *      deliberate change, because it is what the live cue engine was built on
+ *      and it is still covered by tests.
+ *
+ * This server holds ELEVENLABS_API_KEY and SARVAM_API_KEY, server-side only.
+ * No database, no framework: analysis is stateless and nothing uploaded here is
+ * written to disk. An optional shared client token gates both APIs. That token
+ * is a throttle, not authentication: it ships inside the app bundle (see
+ * `PSST_CLIENT_TOKEN` below), so real authorization is a public-release gate,
+ * not something this server does yet.
  */
 
+import { timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 
 import { WebSocket, WebSocketServer } from 'ws';
 
+import { buildDebrief } from './debrief.js';
 import { getElevenLabsConfig, isElevenLabsConfigured } from './elevenlabs.js';
 import { loadServerEnv } from './env.js';
 import { LIMITS, describeLimits } from './limits.js';
 import { encode, noticeMessage, parseClientMessage, recapMessage, statusMessage } from './protocol.js';
 import { buildRecap, createReasoningProvider } from './reasoning.js';
-import { getSarvamConfig, isSarvamConfigured } from './sarvam.js';
+import { SarvamReasoningProvider, getSarvamConfig, isSarvamConfigured } from './sarvam.js';
 import { ConversationSession } from './session.js';
+import { getBatchSttConfig, isBatchSttConfigured, transcribeRecording } from './stt.js';
 import { attachTranscription } from './transcription.js';
 import { MIN_CUE_INTERVAL_MS } from './cue.js';
 
@@ -41,6 +50,10 @@ const CLIENT_TOKEN = process.env.PSST_CLIENT_TOKEN ?? '';
 const SESSION_PATH = /^\/sessions\/([^/]+)\/stream$/;
 /** Longest session id accepted in the URL. */
 const MAX_SESSION_ID_CHARS = 120;
+/** The import analysis endpoint. */
+const DEBRIEF_PATH = '/debrief';
+/** Longest free-text metadata accepted from the query string. */
+const MAX_METADATA_CHARS = 200;
 
 /**
  * Live sessions, keyed by session id.
@@ -53,6 +66,10 @@ const MAX_SESSION_ID_CHARS = 120;
  */
 const sessions = new Map();
 let totalSessions = 0;
+/** Imports currently being read or transcribed, for the concurrency cap. */
+let activeImports = 0;
+/** Start timestamps of recent imports, for the per-minute cap. */
+const recentImportStarts = [];
 /** Process-wide counters for /health. Numbers only. */
 const counters = {
   rejectedAudioFrames: 0,
@@ -61,6 +78,11 @@ const counters = {
   durationLimitEnds: 0,
   audioBudgetEnds: 0,
   handlerErrors: 0,
+  importsCompleted: 0,
+  importsRejected: 0,
+  importsTooLarge: 0,
+  importsTranscribeFailed: 0,
+  importsUnavailable: 0,
 };
 
 function minutes(ms) {
@@ -93,18 +115,281 @@ function sendJson(res, statusCode, body) {
   res.end(payload);
 }
 
+/**
+ * Compares the shared client token without leaking its length through timing.
+ *
+ * This is still not authentication — the token ships in the app bundle — it just
+ * avoids making the throttle trivially guessable character by character.
+ */
+function tokenAccepted(provided) {
+  if (CLIENT_TOKEN.length === 0) return true;
+  if (typeof provided !== 'string' || provided.length === 0) return false;
+
+  const given = Buffer.from(provided);
+  const expected = Buffer.from(CLIENT_TOKEN);
+  if (given.length !== expected.length) return false;
+  return timingSafeEqual(given, expected);
+}
+
+/** Reads a query parameter as trimmed text within a length cap. */
+function readMetadata(url, name, max = MAX_METADATA_CHARS) {
+  const value = url.searchParams.get(name);
+  return typeof value === 'string' ? value.trim().slice(0, max) : '';
+}
+
+/**
+ * Reads a request body, refusing anything past the byte cap.
+ *
+ * The cap is enforced while reading rather than after: a client that ignores the
+ * limit must not be able to make the server buffer an arbitrary body first.
+ *
+ * When the cap is passed the request is **drained, not destroyed**. Destroying it
+ * mid-upload resets the connection, and the client never sees the 413 — the app
+ * would report a network failure for a limit it is supposed to explain. Draining
+ * is bounded (a few times the cap) so an absurd body still cannot hold the
+ * connection open indefinitely.
+ */
+function readBody(req, limit) {
+  const drainCapBytes = limit * 4;
+
+  return new Promise((resolve) => {
+    const chunks = [];
+    let total = 0;
+    let draining = false;
+    let settled = false;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+
+    req.on('data', (chunk) => {
+      total += chunk.length;
+
+      if (draining) {
+        if (total > drainCapBytes) req.destroy();
+        return;
+      }
+
+      if (total > limit) {
+        draining = true;
+        chunks.length = 0;
+        finish({ ok: false, reason: 'too-large' });
+        if (total > drainCapBytes) req.destroy();
+        return;
+      }
+
+      chunks.push(chunk);
+    });
+    req.on('end', () => finish({ ok: true, bytes: Buffer.concat(chunks) }));
+    req.on('error', () => finish({ ok: false, reason: 'read-error' }));
+    req.on('aborted', () => finish({ ok: false, reason: 'aborted' }));
+  });
+}
+
+/** True while this process may start another import. Also records the start. */
+function admitImport(now) {
+  const cutoff = now - 60000;
+  while (recentImportStarts.length > 0 && recentImportStarts[0] < cutoff) recentImportStarts.shift();
+
+  if (recentImportStarts.length >= LIMITS.maxImportsPerMinute) return false;
+  if (activeImports >= LIMITS.maxConcurrentImports) return false;
+
+  recentImportStarts.push(now);
+  return true;
+}
+
+/** The MIME types an imported recording may arrive as. */
+function isAudioContentType(contentType) {
+  const value = String(contentType ?? '').toLowerCase();
+  return value.startsWith('audio/') || value.startsWith('application/octet-stream');
+}
+
+/**
+ * POST /debrief — transcribe one recording and turn it into a Debrief.
+ *
+ * Order matters: the cheap, unambiguous rejections happen before a single byte
+ * of audio is read, and the authoritative duration check happens after the
+ * transcript, because only the provider can measure a file whose container the
+ * client cannot parse.
+ */
+async function handleDebriefRequest(req, res, url) {
+  if (req.method !== 'POST') {
+    sendJson(res, 405, { error: 'Use POST to analyse a recording.' });
+    return;
+  }
+
+  const token = url.searchParams.get('token') ?? req.headers['x-psst-token'];
+  if (!tokenAccepted(token)) {
+    counters.importsRejected += 1;
+    sendJson(res, 401, { error: 'This Psst backend requires a valid client token.' });
+    return;
+  }
+
+  if (!isBatchSttConfigured()) {
+    counters.importsUnavailable += 1;
+    sendJson(res, 503, {
+      error: 'This Psst backend has no transcription provider configured, so it cannot analyse recordings.',
+    });
+    return;
+  }
+
+  const declaredDurationMs = Number(url.searchParams.get('durationMs'));
+  if (Number.isFinite(declaredDurationMs) && declaredDurationMs > LIMITS.maxImportDurationMs) {
+    counters.importsRejected += 1;
+    sendJson(res, 413, {
+      error: `That recording is longer than the ${minutes(
+        LIMITS.maxImportDurationMs
+      )}-minute limit Psst analyses.`,
+    });
+    return;
+  }
+
+  if (!isAudioContentType(req.headers['content-type'])) {
+    counters.importsRejected += 1;
+    sendJson(res, 400, { error: 'Send the recording itself as audio (for example audio/mp4).' });
+    return;
+  }
+
+  const now = Date.now();
+  if (!admitImport(now)) {
+    counters.importsRejected += 1;
+    sendJson(res, 429, { error: 'Psst is analysing other recordings right now. Try again in a minute.' });
+    return;
+  }
+
+  activeImports += 1;
+  const startedAt = Date.now();
+
+  try {
+    const body = await readBody(req, LIMITS.maxImportBytes);
+
+    if (!body.ok) {
+      if (body.reason === 'too-large') {
+        counters.importsTooLarge += 1;
+        // The client is still uploading; close the connection once this answer
+        // has been flushed so the limit is explained rather than reset.
+        res.setHeader('connection', 'close');
+        sendJson(res, 413, {
+          error: `That recording is larger than the ${describeBytes(
+            LIMITS.maxImportBytes
+          )} Psst analyses.`,
+        });
+        return;
+      }
+
+      counters.importsRejected += 1;
+      // An aborted upload may have destroyed the socket already: answer only if
+      // there is still someone able to read it.
+      if (!res.writableEnded && req.socket?.writable) {
+        sendJson(res, 400, { error: 'The recording upload did not complete. Try again.' });
+      }
+      return;
+    }
+
+    if (body.bytes.length === 0) {
+      counters.importsRejected += 1;
+      sendJson(res, 400, { error: 'The recording was empty.' });
+      return;
+    }
+
+    const draft = {
+      title: readMetadata(url, 'title'),
+      contact: readMetadata(url, 'contact'),
+      callType: readMetadata(url, 'callType', 40),
+      durationMs: Number.isFinite(declaredDurationMs) && declaredDurationMs > 0 ? declaredDurationMs : 0,
+    };
+
+    const stt = await transcribeRecording({
+      bytes: body.bytes,
+      fileName: `import-${startedAt}.${(req.headers['content-type'] || '').includes('wav') ? 'wav' : 'm4a'}`,
+      mimeType: String(req.headers['content-type'] ?? 'application/octet-stream'),
+    });
+
+    if (!stt.ok) {
+      counters.importsTranscribeFailed += 1;
+      // Provider detail stays in the server log: it can name internals the app
+      // has no use for, and a submission ID is not the user's business.
+      console.log(`[psst] import transcription failed after ${Date.now() - startedAt}ms`);
+      sendJson(res, 502, {
+        error: 'Psst could not transcribe that recording. Check the file and try again.',
+      });
+      return;
+    }
+
+    if (stt.durationMs > LIMITS.maxImportDurationMs) {
+      counters.importsRejected += 1;
+      sendJson(res, 413, {
+        error: `That recording is longer than the ${minutes(
+          LIMITS.maxImportDurationMs
+        )}-minute limit Psst analyses.`,
+      });
+      return;
+    }
+
+    const reasoning = await buildDebrief({
+      draft,
+      transcript: stt.lines,
+      provider: isSarvamConfigured() ? new SarvamReasoningProvider() : null,
+    });
+
+    counters.importsCompleted += 1;
+    console.log(
+      `[psst] import analysed: ${body.bytes.length}B, ${stt.lines.length} line(s), ` +
+        `${Math.round(stt.durationMs / 1000)}s, ${reasoning.degraded ? 'transcript-only' : 'full debrief'}, ` +
+        `${Date.now() - startedAt}ms`
+    );
+
+    sendJson(res, 200, {
+      ok: true,
+      origin: 'backend',
+      degraded: reasoning.degraded,
+      notice: reasoning.notice,
+      transcript: {
+        lines: stt.lines,
+        durationMs: stt.durationMs,
+        languageCode: stt.languageCode,
+      },
+      debrief: reasoning.debrief,
+    });
+  } catch (error) {
+    // One failed import must never take down a server that is also serving other
+    // people's uploads.
+    counters.handlerErrors += 1;
+    const detail = error instanceof Error ? error.message : String(error);
+    console.log(`[psst] import handler error: ${detail.slice(0, 200)}`);
+    if (!res.headersSent) {
+      sendJson(res, 500, { error: 'Psst could not analyse that recording.' });
+    }
+  } finally {
+    activeImports -= 1;
+  }
+}
+
 function handleRequest(req, res) {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
 
+  if (url.pathname === DEBRIEF_PATH) {
+    void handleDebriefRequest(req, res, url);
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/health') {
     const elevenlabs = getElevenLabsConfig();
+    const batchStt = getBatchSttConfig();
     sendJson(res, 200, {
       status: 'ok',
       service: 'psst-backend',
-      phase: '2b',
+      phase: 'import',
       // Booleans and names only: no key material, ever.
       elevenlabsConfigured: isElevenLabsConfigured(),
       sarvamConfigured: isSarvamConfigured(),
+      // The import pipeline: batch transcription, then the debrief. A recording
+      // can only be analysed when the first of these is configured.
+      importAnalysisReady: isBatchSttConfigured(),
+      batchSttModel: batchStt.modelId,
+      batchSttDiarize: batchStt.diarize,
       elevenlabsModel: elevenlabs.modelId,
       elevenlabsCommitStrategy: elevenlabs.commitStrategy,
       elevenlabsCommitStrategyRejected: elevenlabs.commitStrategyRejected,
@@ -112,6 +397,7 @@ function handleRequest(req, res) {
       sarvamModel: getSarvamConfig().model,
       minCueIntervalMs: MIN_CUE_INTERVAL_MS,
       tokenRequired: CLIENT_TOKEN.length > 0,
+      activeImports,
       activeSessions: sessions.size,
       totalSessions,
       ...counters,
@@ -533,8 +819,11 @@ wss.on('connection', (socket, _req, session, releaseReservation) => {
 
 const httpServer = server.listen(PORT, HOST, () => {
   const elevenlabs = getElevenLabsConfig();
-  console.log(`[psst] backend listening on http://${HOST}:${PORT} (phase 2b)`);
-  console.log(`[psst] session endpoint: ws://${HOST}:${PORT}/sessions/{id}/stream`);
+  console.log(`[psst] backend listening on http://${HOST}:${PORT} (import debriefs)`);
+  console.log(`[psst] import endpoint: POST http://${HOST}:${PORT}/debrief`);
+  console.log(
+    `[psst] legacy session endpoint (unused by the app): ws://${HOST}:${PORT}/sessions/{id}/stream`
+  );
   console.log(
     `[psst] elevenlabs: ${
       isElevenLabsConfigured()
@@ -549,6 +838,16 @@ const httpServer = server.listen(PORT, HOST, () => {
   );
   console.log(
     `[psst] limits: maxPayload=${LIMITS.maxPayloadBytes}B maxFrame=${LIMITS.maxAudioFrameBytes}B sessions=${LIMITS.maxSessions} idle=${minutes(LIMITS.idleTimeoutMs)}min duration=${minutes(LIMITS.maxSessionDurationMs)}min`
+  );
+  const batchStt = getBatchSttConfig();
+  console.log(
+    `[psst] import analysis: ${
+      isBatchSttConfigured()
+        ? `ready (${batchStt.modelId}, diarize=${batchStt.diarize})`
+        : 'unavailable (no transcription provider configured)'
+    } maxImport=${describeBytes(LIMITS.maxImportBytes)} maxImportDuration=${minutes(
+      LIMITS.maxImportDurationMs
+    )}min perMinute=${LIMITS.maxImportsPerMinute} concurrent=${LIMITS.maxConcurrentImports}`
   );
   console.log(`[psst] client token: ${CLIENT_TOKEN.length > 0 ? 'required' : 'not required'}`);
 });

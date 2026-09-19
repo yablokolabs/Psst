@@ -1,17 +1,26 @@
 # Psst backend
 
-Realtime backend for the Psst app. It owns the WebSocket session API, holds both provider secrets,
-streams microphone audio into ElevenLabs for real-time speech-to-text, runs the Psst reasoning
-engine on committed utterances and returns a recap when the session ends.
+Backend for the Psst app. Its job is the **import pipeline**: one recording in, one Debrief out.
 
 ```
 Psst app (S24 Ultra)              server/                                  ElevenLabs
-  mic ─▶ audio.frame ─▶ session API ─▶ STT session ─▶ partial/committed ─▶ transcript frames
-                          │                                                     │
-                          └── conversation state ─▶ Sarvam reasoning ◀──────────┘
-                                                          │
-                                                 NO_ACTION / PSST ─▶ cue frame
+  imported file ─▶ POST /debrief ─▶ raw audio, metadata in the query ─▶ batch STT (scribe_v2)
+                                                                              │
+                                     labelled transcript ◀───────────────────┘
+                                                 │
+                                                 ▼
+                                        Sarvam structured completion
+                                                 │
+                                    Debrief JSON ─▶ back to the app ─▶ SQLite
 ```
+
+The upload is transcribed, analysed and **discarded**: nothing is written to disk, and only the
+transcript and the debrief travel back. The app keeps the recording on the device.
+
+The server also still carries the realtime WebSocket session API (`WS /sessions/:id/stream`) that
+the live cue engine was built on. **The app no longer opens it** — Psst is import-first, and no app
+can capture a phone call's audio — so it is dormant here rather than deleted. Its documentation
+below is kept accurate so the choice to remove it later is an informed one.
 
 `ELEVENLABS_API_KEY` and `SARVAM_API_KEY` live here and nowhere else: they are never sent to the
 app, never logged and never returned from an endpoint.
@@ -20,9 +29,11 @@ app, never logged and never returned from an endpoint.
 
 ```
 src/
-  index.js          HTTP + WebSocket server, /health, session routing, lifecycle
+  index.js          HTTP + WebSocket server, /health, POST /debrief, session routing, lifecycle
   env.js            Loads server/.env then the repo-root .env (real env vars always win)
   limits.js         Every server-side ceiling, env-overridable, reported by /health
+  stt.js            Batch transcription of one file (the import pipeline's STT)
+  debrief.js        Debrief schema, prompt, validation and clamping
   protocol.js       Wire protocol (mirrors src/types/realtime.ts in the app)
   session.js        In-memory session state: transcript, cues, clock, audio diagnostics
   audio.js          PCM format helpers (sample rate -> provider audio format)
@@ -58,16 +69,77 @@ bundle or a build log.
 Endpoints:
 
 - `GET /health` — status. Reports configuration as **booleans, model names and numbers only**, plus
-  session counts, drop/throttle counters and the effective limits. No key material, ever.
-- `WS /sessions/:id/stream` — the session channel used by the app.
+  import/session counters and the effective limits. No key material, ever.
+- `POST /debrief` — the import pipeline the app uses today (below).
+- `WS /sessions/:id/stream` — the legacy realtime session channel, no longer opened by the app.
+
+## Import API (`POST /debrief`)
+
+The pipeline the app uses: one recording in, one Debrief out.
+
+```
+POST /debrief?callType=sales&title=Acme%20pilot&contact=Priya&durationMs=1860000[&token=…]
+Content-Type: audio/mp4
+
+<raw audio bytes>
+```
+
+Metadata travels in the query string, so the body stays the recording itself: one contiguous upload
+the phone can report progress for, and no multipart parser here. The `token` is also accepted as an
+`x-psst-token` header and is compared in constant time — still a throttle, not authentication.
+
+Rejections happen in cost order, cheapest first, and none of them reads or forwards audio:
+
+| Status | When | Before/after transcription |
+| --- | --- | --- |
+| `405` | not a POST | before |
+| `401` | a token is required and missing or wrong | before |
+| `503` | no transcription provider configured (`/health` says `importAnalysisReady: false`) | before |
+| `413` | the client's declared `durationMs` is over the limit | before |
+| `400` | the content type is not `audio/*` | before |
+| `429` | over `maxImportsPerMinute`, or `maxConcurrentImports` already running | before |
+| `413` | the body exceeds `maxImportBytes` | while reading |
+| `400` | an empty body, or an upload that never completed | while reading |
+| `502` | the provider refused or failed (the recording is fine) | after |
+| `413` | the transcript shows the recording is longer than `maxImportDurationMs` | after |
+
+The oversized case **drains rather than destroys** the request: resetting the socket mid-upload means
+the client never sees the 413 and the app reports a network failure for a limit it is supposed to
+explain. Draining is bounded at four times the cap, after which the connection is dropped.
+
+`200` answers with `{ ok, origin, degraded, notice, transcript: { lines, durationMs, languageCode },
+ debrief }`. A `degraded: true` plus a `notice` means the transcript is real but the summary is not —
+the app shows the transcript and says so rather than inventing sections.
+
+How the transcript is built (`src/stt.js`):
+
+- `POST https://api.elevenlabs.io/v1/speech-to-text`, multipart, `xi-api-key` header,
+  `model_id=scribe_v2`, `diarize=true`, `timestamps_granularity=word`, `no_verbatim=true`.
+- Words are grouped into lines: same speaker, until that speaker pauses for more than 700 ms, capped
+  at 4000 lines. Audio events (`(laughter)`) are dropped rather than transcribed.
+- Diarization labels are kept as `label` (`"Speaker 1"`) while `speaker` stays `"unknown"`. A
+  recording cannot tell which voice is the user's, and guessing would misattribute every commitment
+  in the debrief.
+- The recording's length comes from the last word's end time, which is what makes the duration limit
+  enforceable without parsing the container.
+
+How the debrief is built (`src/debrief.js`): one structured completion against the same Sarvam
+provider the cues used, with an explicit schema. The prompt forbids inventing facts, and every field
+is validated and clamped afterwards (`normalizeDebrief`): a `what`-less commitment is dropped, an
+unrecognised owner becomes `unknown`, ≤ 20 items per section, ≤ 400 characters per field. A debrief
+that confidently invents a deadline is worse than an empty section.
 
 ## Environment variables
 
 | Variable | Secret? | Purpose |
 | --- | --- | --- |
 | `PORT` / `HOST` | no | Listen port (8787) and bind address (default `0.0.0.0`). **Precedence note:** systemd reads `EnvironmentFile=` *after* `Environment=`, so a value in an env file beats one in the unit file — keep `HOST` in exactly one place. When a reverse proxy or tunnel fronts the backend (the normal deployment), set `HOST=127.0.0.1`: then nothing can reach `:8787` directly. |
-| `PSST_CLIENT_TOKEN` | access token | When set, clients must connect with `?token=…`. Not a substitute for real auth. |
-| `ELEVENLABS_API_KEY` | **SERVER-SIDE SECRET** | Read by `src/elevenlabs.js` only. |
+| `PSST_CLIENT_TOKEN` | access token | When set, clients must send `?token=…` (or `x-psst-token`). Not a substitute for real auth. |
+| `ELEVENLABS_API_KEY` | **SERVER-SIDE SECRET** | Read by `src/elevenlabs.js` and `src/stt.js` only. |
+| `ELEVENLABS_STT_FILE_ENDPOINT` | no | Batch STT endpoint (default `https://api.elevenlabs.io/v1/speech-to-text`). Also how the tests point the import pipeline at a local fake. |
+| `ELEVENLABS_STT_FILE_MODEL` | no | Batch STT model (default `scribe_v2`). |
+| `ELEVENLABS_STT_DIARIZE` | no | Speaker labels on imports (default `true`). |
+| `PSST_STT_FILE_TIMEOUT_MS` | no | Budget for one batch transcription (default 300000). |
 | `ELEVENLABS_STT_ENDPOINT` | no | Realtime STT endpoint (default `wss://api.elevenlabs.io/…`). Also how the tests point the client at a local fake. |
 | `ELEVENLABS_STT_MODEL` | no | Realtime STT model (default `scribe_v2_realtime`). |
 | `ELEVENLABS_STT_COMMIT_STRATEGY` | no | `vad` (default, commits on silence) or `manual`. Anything else falls back to `vad` and is reported by `/health`. |
@@ -96,6 +168,10 @@ Limits (all optional; `/health` reports the effective values):
 | `PSST_IDLE_TIMEOUT_MS` | 180000 | silence before a session is ended with an explanation |
 | `PSST_MAX_SESSION_DURATION_MS` | 3600000 | hard ceiling on one session |
 | `PSST_MAX_MESSAGES_PER_SEC` | 300 | audio frames per second (control frames are never throttled) |
+| `PSST_MAX_IMPORT_BYTES` | 52428800 | one imported recording (50 MB) |
+| `PSST_MAX_IMPORT_DURATION_MS` | 14400000 | length of one imported recording, from the transcript (4 h) |
+| `PSST_MAX_IMPORTS_PER_MINUTE` | 6 | imports started per minute, process-wide |
+| `PSST_MAX_CONCURRENT_IMPORTS` | 2 | imports being read or transcribed at once |
 
 Set `PSST_MAX_PROVIDER_QUEUE_BYTES` above `PSST_MAX_AUDIO_FRAME_BYTES` (base64 is ~4/3 of the payload),
 or a single frame will not fit in the pre-open queue and everything will be dropped.
@@ -117,7 +193,10 @@ different stories about how long a session can last.
 Never expose either key to the client, never rename them to `EXPO_PUBLIC_*`, never log them and
 never return them from an endpoint.
 
-## Protocol
+## Realtime protocol (legacy, dormant)
+
+The app no longer opens this channel. It is documented because the tests still cover it and because
+removing it should be a deliberate decision.
 
 Client → backend:
 
@@ -235,8 +314,25 @@ npm run providers   # real calls. See below.
 npm run providers -- --recap   # also exercise the model-written recap
 ```
 
-`npm test` runs `test/*.test.js` against a local fake STT endpoint — the same production code path,
-with no provider involved. It covers the malformed frame that used to take the process down, numeric
+`npm test` runs `test/*.test.js` against local fakes — the same production code paths, with no
+provider involved and nothing billed. The import pipeline is covered end to end:
+
+- the upload really happens: the fake reads the multipart request the backend built and asserts the
+  file bytes, `model_id=scribe_v2`, `diarize`, and that the key travelled in the `xi-api-key` header
+  and never appeared in an app-facing body;
+- diarized words become two labelled lines with `speaker: "unknown"`, and non-word events are dropped;
+- every rejection path answers without billing: not-audio (`400`), empty (`400`), oversized (`413`,
+  with the fake proving nothing reached the provider), over-duration (`413`), missing token (`401`),
+  rate limited (`429`), provider failure (`502`) — and `/health` still answers afterwards, including
+  after an abandoned half-sent upload;
+- a transcript still comes back, marked `degraded`, when no analysis model is configured;
+- `normalizeDebrief` drops a commitment with no `what`, downgrades an unrecognised owner to `unknown`,
+  falls back from a missing risk label to its detail, and caps a section at 20 items;
+- `formatTranscriptForPrompt` keeps the end of a long call and says how many lines it omitted;
+- `transcribeRecording` reports HTTP failures, silence and thrown sockets as results, never as throws.
+
+It also covers the legacy realtime path: the malformed frame that used to take the process down,
+numeric
 metadata carrying an object (`{"toString":null,"valueOf":null}`) that `Number()` throws on, the
 sample rate arriving at the provider unchanged (16 k/44.1 k/48 k through the real wire), survival of a
 disconnect during STT connection setup, final-utterance preservation through a stop, the pause
@@ -248,7 +344,9 @@ delayed by the fakes) and still delivering exactly one honest recap, bounded aud
 every limit above. From the repository root, `npm test` also runs the app-side transport tests in
 `test/client/`.
 
-`provider-test.js` is a genuine end-to-end check of the server-side pipeline:
+`provider-test.js` is a genuine end-to-end check of the server-side pipeline — and it still exercises
+the **legacy realtime** path, which the app no longer uses. Use it to validate the provider
+credentials themselves, not the import flow:
 
 1. **ElevenLabs TTS** synthesises the acceptance sentence as PCM16 16 kHz (this machine has no
    microphone).
@@ -370,9 +468,17 @@ EXPO_PUBLIC_PSST_BACKEND_TOKEN=the-same-shared-token     # only if PSST_CLIENT_T
 
 0. **Public-release gate — real access control.** `PSST_CLIENT_TOKEN` is a shared token that ships
    inside the app bundle, so it is a throttle, not authentication. Before this backend faces the
-   public, it needs verified identity (RevenueCat webhook or REST API), per-user rate limiting and
-   a retention decision for transcripts. Until then, keep it restricted to testers.
-1. Real access control: verify the caller's Psst Pro entitlement (RevenueCat webhook or REST API)
-   instead of the shared `PSST_CLIENT_TOKEN`.
-2. Retention policy and logging review for transcripts held in memory.
-3. Speaker separation is not implemented: every line is labelled `them`.
+   public it needs verified identity (RevenueCat webhook or REST API), per-user rate limiting, and a
+   retention decision for the transcripts it returns. Until then, keep it restricted to testers.
+   On the test VM today `PSST_CLIENT_TOKEN` is unset, so the import endpoint is open to anyone who
+   finds the tunnel hostname.
+1. **Delete the legacy realtime session API** once nothing needs it: `protocol.js`, `session.js`,
+   `transcription.js`, `elevenlabs.js`'s realtime half, `reasoning.js` and `cue.js` are all kept alive
+   by tests rather than by the app.
+2. **Speaker roles.** Diarization labels voices but cannot say which one is the user, so commitments
+   whose owner is unclear stay `unknown`. A per-user voice profile, or letting the user label a
+   speaker once per debrief, is the honest way to improve this.
+3. **Upload streaming.** A 50 MB cap means at most ~50 MB of body plus a same-sized multipart copy in
+   memory. Streaming the request straight into the provider request would remove that ceiling.
+4. **Language pinning.** Set `ELEVENLABS_STT_LANGUAGE` when accented speech mis-transcribes; today it
+   auto-detects.

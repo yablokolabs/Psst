@@ -1,26 +1,34 @@
 import Constants from 'expo-constants';
 import { useRouter } from 'expo-router';
-import { useCallback, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { PrimaryButton } from '@/components/PrimaryButton';
 import { ProBadge } from '@/components/ProBadge';
 import { Screen } from '@/components/Screen';
-import { FREE_LIVE_MINUTES } from '@/constants/plans';
+import { FREE_HISTORY_LIMIT, FREE_IMPORTS_PER_MONTH } from '@/constants/plans';
 import { Palette, Radii, Spacing } from '@/constants/theme';
+import { useDebriefs } from '@/hooks/use-debriefs';
 import { usePro } from '@/hooks/use-pro';
-import { useSessionHistory } from '@/hooks/use-session-history';
 import { isBackendConfigured } from '@/services/backend';
-import { DEFAULT_CONVERSATION_MODE } from '@/services/conversation';
 
 export default function SettingsScreen() {
   const router = useRouter();
   const { isPro, availability, message, restore } = usePro();
-  const { sessions, clearSessions } = useSessionHistory();
+  const { debriefs, clearAll } = useDebriefs();
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const appVersion = Constants.expoConfig?.version ?? '1.0.0';
+
+  const withRecording = useMemo(
+    () => debriefs.filter((debrief) => debrief.audio !== null).length,
+    [debriefs]
+  );
+  const openTasks = useMemo(
+    () => debriefs.reduce((total, debrief) => total + debrief.tasks.filter((task) => !task.done).length, 0),
+    [debriefs]
+  );
 
   const handleRestore = useCallback(async () => {
     setBusy(true);
@@ -34,21 +42,23 @@ export default function SettingsScreen() {
 
   const confirmClear = useCallback(() => {
     Alert.alert(
-      'Clear conversation history?',
-      'This removes the recaps stored on this device for the current app session.',
+      'Delete every debrief?',
+      'This removes every debrief and every recording Psst saved on this device. It cannot be undone.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
-          text: 'Clear',
+          text: 'Delete all',
           style: 'destructive',
           onPress: () => {
-            clearSessions();
-            setNotice('Conversation history cleared.');
+            void (async () => {
+              await clearAll();
+              setNotice('Every debrief and recording was deleted.');
+            })();
           },
         },
       ]
     );
-  }, [clearSessions]);
+  }, [clearAll]);
 
   return (
     <Screen
@@ -74,17 +84,26 @@ export default function SettingsScreen() {
       ) : null}
 
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>LISTENING & PRIVACY</Text>
-        <Row label="Sessions" value="Only while you press start" />
-        <Row label="Indicator" value="Listening state always visible" />
-        <Row
-          label="Free listening"
-          value={isPro ? 'Unlimited (Psst Pro)' : `${FREE_LIVE_MINUTES} minutes per session`}
-        />
+        <Text style={styles.cardTitle}>PRIVACY & RETENTION</Text>
+        <Row label="Debriefs stored" value={`${debriefs.length}`} />
+        <Row label="Recordings kept" value={`${withRecording}`} />
+        <Row label="Open follow-ups" value={`${openTasks}`} />
         <Text style={styles.cardBody}>
-          Psst never records in the background. Every session is started and ended by you, and the
-          microphone indicator stays on screen while Psst is listening.
+          Psst never records a call and never joins one. It only reads recordings you import, and
+          only after you confirm the consent notice. Every debrief and its recording stay on this
+          device; the audio you send for analysis is used once and discarded, never stored on the
+          backend.
         </Text>
+        <Text style={styles.cardBody}>
+          Deleting a recording keeps its debrief. Deleting a debrief removes both.
+        </Text>
+        <PrimaryButton
+          label="Delete all debriefs and recordings"
+          variant="destructive"
+          onPress={confirmClear}
+          disabled={debriefs.length === 0}
+          hint={debriefs.length === 0 ? 'Nothing stored yet' : undefined}
+        />
       </View>
 
       <View style={styles.card}>
@@ -93,6 +112,14 @@ export default function SettingsScreen() {
           {isPro ? <ProBadge label="ACTIVE" solid /> : <ProBadge />}
         </View>
         <Row label="Plan" value={isPro ? 'Psst Pro' : 'Free'} />
+        <Row
+          label="Analysed recordings"
+          value={isPro ? 'Unlimited' : `${FREE_IMPORTS_PER_MONTH} per month`}
+        />
+        <Row
+          label="Timeline"
+          value={isPro ? 'Everything, searchable' : `Last ${FREE_HISTORY_LIMIT} debriefs`}
+        />
         <Row label="Store status" value={availabilityLabel(availability)} />
         {message && availability !== 'ready' ? (
           <Text style={styles.cardBody}>{message}</Text>
@@ -112,46 +139,28 @@ export default function SettingsScreen() {
       </View>
 
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>CONVERSATIONS</Text>
-        <Row label="Stored recaps" value={`${sessions.length}`} />
-        <Text style={styles.cardBody}>
-          Recaps live in memory for this app session. Persistent history arrives with the backend.
-        </Text>
-        <PrimaryButton
-          label="Clear conversation history"
-          variant="secondary"
-          onPress={confirmClear}
-          disabled={sessions.length === 0}
-          hint={sessions.length === 0 ? 'Nothing to clear yet' : undefined}
-        />
-      </View>
-
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>CONNECTIONS</Text>
+        <Text style={styles.cardTitle}>ANALYSIS</Text>
         <Row
-          label="Realtime backend"
+          label="Backend"
           value={isBackendConfigured() ? 'Configured' : 'Not configured'}
         />
-        <Row
-          label="Default engine"
-          value={DEFAULT_CONVERSATION_MODE === 'realtime' ? 'Live audio' : 'Demo'}
-        />
-        <Row label="Microphone" value="Only during a session you start" />
         <Text style={styles.cardBody}>
-          Live audio streams microphone samples to the Psst backend, which transcribes them and
-          decides whether anything is worth saying. Both provider keys stay on the server; the app
-          only ever holds the backend URL.
           {isBackendConfigured()
-            ? ''
-            : ' No backend is configured in this build, so Psst runs the offline demo engine.'}
+            ? 'An imported recording is transcribed and analysed by the Psst backend, which holds the provider keys. The app only ever holds the backend URL.'
+            : 'No analysis backend is configured in this build, so imports produce an offline demo debrief instead. Nothing is uploaded anywhere.'}
         </Text>
+        <Row label="Microphone" value="Not used — Psst has no recording permission" />
       </View>
 
       <View style={styles.card}>
         <Text style={styles.cardTitle}>ABOUT</Text>
         <Row label="Psst" value={`Version ${appVersion}`} />
-        <Row label="Build" value="Phase 2b · live microphone + realtime transcription" />
+        <Row label="Build" value="Import-first · debrief and memory" />
         <Row label="Platform" value="Android first (Galaxy S24 Ultra target)" />
+        <Text style={styles.cardBody}>
+          Psst is not a call recorder. It is the memory, follow-through and relationship layer that
+          comes after a call.
+        </Text>
       </View>
     </Screen>
   );

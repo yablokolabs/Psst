@@ -1,23 +1,57 @@
 import { useRouter } from 'expo-router';
+import { useCallback, useMemo, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
+import { DebriefRow } from '@/components/DebriefRow';
 import { PrimaryButton } from '@/components/PrimaryButton';
 import { ProBadge } from '@/components/ProBadge';
 import { PsstLogo, PsstMark } from '@/components/PsstLogo';
 import { Screen } from '@/components/Screen';
-import { SessionRow } from '@/components/SessionRow';
+import { TextField } from '@/components/TextField';
 import { FREE_HISTORY_LIMIT } from '@/constants/plans';
 import { Palette, Radii, Spacing } from '@/constants/theme';
+import { useDebriefs } from '@/hooks/use-debriefs';
 import { usePro } from '@/hooks/use-pro';
-import { useSessionHistory } from '@/hooks/use-session-history';
+import { createDemoDebrief } from '@/services/demoDebrief';
 
 export default function HomeScreen() {
   const router = useRouter();
-  const { sessions } = useSessionHistory();
+  const { debriefs, loading, error, add, search } = useDebriefs();
   const { isPro } = usePro();
+  const [query, setQuery] = useState('');
+  const [sampleBusy, setSampleBusy] = useState(false);
 
-  const visibleSessions = isPro ? sessions : sessions.slice(0, FREE_HISTORY_LIMIT);
-  const lockedCount = sessions.length - visibleSessions.length;
+  const results = useMemo(() => {
+    const filtered = search(query);
+    // Search reads the whole timeline: hiding matches behind the free limit
+    // would look like a broken search rather than a paywall.
+    return query.trim() === '' && !isPro ? filtered.slice(0, FREE_HISTORY_LIMIT) : filtered;
+  }, [search, query, isPro]);
+
+  const lockedCount =
+    query.trim() === '' && !isPro ? Math.max(0, debriefs.length - FREE_HISTORY_LIMIT) : 0;
+
+  /** The offline demo path: a full example debrief with no credentials at all. */
+  const openSample = useCallback(async () => {
+    setSampleBusy(true);
+    try {
+      const debrief = createDemoDebrief({
+        title: 'Sample: Acme pilot call',
+        contact: 'Priya Raman',
+        callType: 'sales',
+        recordedAt: new Date().toISOString(),
+        durationMs: 31 * 60 * 1000,
+        audio: { uri: '', fileName: '', bytes: 0, mimeType: '' },
+        consentAt: new Date().toISOString(),
+      });
+      // The sample has no source audio, only the debrief.
+      const stored = { ...debrief, id: `sample-${debrief.id}`, audio: null };
+      await add(stored);
+      router.push({ pathname: '/debrief', params: { id: stored.id } });
+    } finally {
+      setSampleBusy(false);
+    }
+  }, [add, router]);
 
   return (
     <Screen scroll contentStyle={styles.content}>
@@ -44,63 +78,110 @@ export default function HomeScreen() {
 
       <View style={styles.hero}>
         <PsstMark size="lg" />
-        <Text style={styles.tagline}>Know what to say next.</Text>
-        <Text style={styles.subtitle}>Your real-time AI conversation copilot.</Text>
+        <Text style={styles.tagline}>Record anywhere.{'\n'}Let Psst remember everything.</Text>
+        <Text style={styles.subtitle}>
+          Import a call recording and get the decisions, commitments and follow-ups out of it.
+        </Text>
       </View>
 
       <PrimaryButton
-        label="Start a Psst"
-        onPress={() => router.push('/prep')}
-        testID="start-psst"
+        label="Import a recording"
+        onPress={() => router.push('/import')}
+        testID="import-recording"
       />
 
-      <View style={styles.flowRow}>
-        <FlowStep index="1" title="Prep" body="What it's about and what you want" />
-        <FlowStep index="2" title="Live" body="Short private cues, only when useful" />
-        <FlowStep index="3" title="Recap" body="Commitments and next actions" />
-      </View>
+      <Pressable
+        onPress={openSample}
+        disabled={sampleBusy}
+        accessibilityRole="button"
+        accessibilityLabel="Try a sample debrief"
+        testID="try-sample"
+        style={({ pressed }) => [styles.sampleButton, pressed && styles.pressed]}>
+        <Text style={styles.sampleLabel}>
+          {sampleBusy ? 'Opening…' : 'Try a sample debrief'}
+        </Text>
+      </Pressable>
 
       <View style={styles.section}>
-        <Text style={styles.sectionTitle}>RECENT CONVERSATIONS</Text>
+        <Text style={styles.sectionTitle}>YOUR DEBRIEFS</Text>
 
-        {sessions.length === 0 ? (
+        {debriefs.length > 0 ? (
+          <TextField
+            label="Search"
+            value={query}
+            onChangeText={setQuery}
+            placeholder="Name, company, or anything said"
+            autoCorrect={false}
+            returnKeyType="search"
+            testID="search-debriefs"
+          />
+        ) : null}
+
+        {error ? (
           <View style={styles.emptyCard}>
-            <Text style={styles.emptyTitle}>No conversations yet</Text>
+            <Text style={styles.emptyTitle}>Storage problem</Text>
+            <Text style={styles.emptyBody}>{error}</Text>
+          </View>
+        ) : null}
+
+        {!error && loading ? (
+          <View style={styles.emptyCard}>
+            <Text style={styles.emptyBody}>Opening your debriefs…</Text>
+          </View>
+        ) : null}
+
+        {!error && !loading && debriefs.length === 0 ? (
+          <View style={styles.emptyCard}>
+            <Text style={styles.emptyTitle}>No debriefs yet</Text>
             <Text style={styles.emptyBody}>
-              Start a Psst and your recaps will appear here.
+              Import a call recording and Psst will write the debrief. Try the sample if you just
+              want to see one.
             </Text>
           </View>
-        ) : (
+        ) : null}
+
+        {!error && debriefs.length > 0 && results.length === 0 ? (
+          <View style={styles.emptyCard}>
+            <Text style={styles.emptyTitle}>No match for “{query.trim()}”</Text>
+            <Text style={styles.emptyBody}>Search looks at titles, names, and what was said.</Text>
+          </View>
+        ) : null}
+
+        {results.length > 0 ? (
           <View style={styles.list}>
-            {visibleSessions.map((session) => (
-              <SessionRow
-                key={session.id}
-                session={session}
-                onPress={() =>
-                  router.push({ pathname: '/recap', params: { id: session.id } })
-                }
+            {results.map((debrief) => (
+              <DebriefRow
+                key={debrief.id}
+                debrief={debrief}
+                onPress={() => router.push({ pathname: '/debrief', params: { id: debrief.id } })}
               />
             ))}
-
-            {lockedCount > 0 ? (
-              <Pressable
-                onPress={() => router.push('/pro')}
-                accessibilityRole="button"
-                accessibilityLabel={`${lockedCount} more conversations in Psst Pro`}
-                style={({ pressed }) => [styles.lockedRow, pressed && styles.pressed]}>
-                <ProBadge />
-                <Text style={styles.lockedText}>
-                  {lockedCount} older {lockedCount === 1 ? 'conversation' : 'conversations'} kept
-                  with Psst Pro
-                </Text>
-              </Pressable>
-            ) : null}
           </View>
-        )}
+        ) : null}
+
+        {lockedCount > 0 ? (
+          <Pressable
+            onPress={() => router.push('/pro')}
+            accessibilityRole="button"
+            accessibilityLabel={`${lockedCount} more debriefs in Psst Pro`}
+            style={({ pressed }) => [styles.lockedRow, pressed && styles.pressed]}>
+            <ProBadge />
+            <Text style={styles.lockedText}>
+              {lockedCount} older {lockedCount === 1 ? 'debrief' : 'debriefs'} kept with Psst Pro
+            </Text>
+          </Pressable>
+        ) : null}
+      </View>
+
+      <View style={styles.flowRow}>
+        <FlowStep index="1" title="Record" body="Any recorder, or a file someone sent you" />
+        <FlowStep index="2" title="Import" body="Share it to Psst and agree to the notice" />
+        <FlowStep index="3" title="Debrief" body="Decisions, follow-ups and what you promised" />
       </View>
 
       <Text style={styles.privacy}>
-        Psst only listens during sessions you start, and tells you while it is listening.
+        Psst only reads the recordings you import, and tells you before anything is sent for
+        analysis. It never records a call and never joins one.
       </Text>
     </Screen>
   );
@@ -157,7 +238,7 @@ const styles = StyleSheet.create({
   },
   tagline: {
     fontSize: 26,
-    lineHeight: 32,
+    lineHeight: 33,
     fontWeight: '700',
     color: Palette.text,
     textAlign: 'center',
@@ -168,34 +249,15 @@ const styles = StyleSheet.create({
     color: Palette.textSecondary,
     textAlign: 'center',
   },
-  flowRow: {
-    flexDirection: 'row',
-    gap: Spacing.two,
+  sampleButton: {
+    alignSelf: 'center',
+    paddingVertical: Spacing.two,
+    paddingHorizontal: Spacing.three,
   },
-  flowStep: {
-    flex: 1,
-    backgroundColor: Palette.backgroundElement,
-    borderRadius: Radii.md,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: Palette.border,
-    padding: Spacing.two,
-    gap: 2,
-  },
-  flowIndex: {
-    fontSize: 10,
-    fontWeight: '800',
-    letterSpacing: 1.2,
-    color: Palette.accent,
-  },
-  flowTitle: {
+  sampleLabel: {
     fontSize: 14,
     fontWeight: '600',
-    color: Palette.text,
-  },
-  flowBody: {
-    fontSize: 12,
-    lineHeight: 16,
-    color: Palette.textFaint,
+    color: Palette.accentSoft,
   },
   section: {
     gap: Spacing.two,
@@ -241,6 +303,35 @@ const styles = StyleSheet.create({
     flex: 1,
     fontSize: 13,
     color: Palette.textSecondary,
+  },
+  flowRow: {
+    flexDirection: 'row',
+    gap: Spacing.two,
+  },
+  flowStep: {
+    flex: 1,
+    backgroundColor: Palette.backgroundElement,
+    borderRadius: Radii.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: Palette.border,
+    padding: Spacing.two,
+    gap: 2,
+  },
+  flowIndex: {
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 1.2,
+    color: Palette.accent,
+  },
+  flowTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: Palette.text,
+  },
+  flowBody: {
+    fontSize: 12,
+    lineHeight: 16,
+    color: Palette.textFaint,
   },
   privacy: {
     fontSize: 12,

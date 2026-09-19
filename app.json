@@ -37,13 +37,19 @@
       [
         "expo-audio",
         {
-          "microphonePermission": "Allow Psst to listen during a session you start. Audio is used to show your transcript and private cues, and only while the session is running.",
-          "recordAudioAndroid": true,
+          "recordAudioAndroid": false,
           "enableBackgroundRecording": false,
           "enableBackgroundPlayback": false
         }
       ],
-      "expo-asset"
+      [
+        "expo-calendar",
+        {
+          "calendarPermission": "Allow Psst to add a reminder for the follow-ups you agree during a call."
+        }
+      ],
+      "expo-asset",
+      "expo-sqlite"
     ],
     "experiments": {
       "typedRoutes": true,

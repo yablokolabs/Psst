@@ -134,13 +134,85 @@ export async function startFakeProvider(initialOptions = {}) {
 }
 
 /**
+ * A fake ElevenLabs **batch** transcription endpoint.
+ *
+ * The import pipeline posts one multipart body and reads one JSON transcript
+ * back, so this fake only has to accept that body and answer in the documented
+ * shape. Every request is recorded (headers and raw bytes) so a test can prove
+ * what the backend actually sent: the file, the model, and that the key travelled
+ * in the header and never appeared in a response.
+ *
+ * @param {{ status?: number, payload?: object, entries?: Array<{speaker: string, text: string, start: number}> }} [options]
+ */
+export async function startFakeBatchStt(options = {}) {
+  const requests = [];
+
+  /** Two speakers with a pause between them, so line grouping is exercised. */
+  const defaultEntries = [
+    { speaker: 'speaker_0', text: 'Two thousand dollars per month is above our budget.', start: 0 },
+    { speaker: 'speaker_1', text: 'I will send the deck on Friday.', start: 4 },
+  ];
+
+  const words = [];
+  for (const entry of options.entries ?? defaultEntries) {
+    let at = entry.start;
+    for (const token of entry.text.split(' ')) {
+      words.push({ text: token, type: 'word', start: at, end: at + 0.2, speaker_id: entry.speaker });
+      at += 0.25;
+    }
+  }
+
+  const payload = options.payload ?? {
+    language_code: 'eng',
+    language_probability: 0.99,
+    text: words.map((word) => word.text).join(' '),
+    words,
+  };
+
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      requests.push({
+        url: req.url ?? '',
+        contentType: String(req.headers['content-type'] ?? ''),
+        apiKey: String(req.headers['xi-api-key'] ?? ''),
+        body: Buffer.concat(chunks),
+      });
+
+      const status = Number(options.status ?? 200);
+      if (status !== 200) {
+        res.writeHead(status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ detail: 'fake transcription failure' }));
+        return;
+      }
+
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(payload));
+    });
+    req.on('error', () => {});
+  });
+
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  return {
+    endpoint: `http://127.0.0.1:${server.address().port}/v1/speech-to-text`,
+    requests,
+    lastRequest: () => requests.at(-1) ?? null,
+    close: async () => {
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+/**
  * A fake Sarvam chat-completions endpoint.
  *
  * Only used when a test needs a deliberately slow **recap**: the backend asks the
  * provider for the summary after it has flushed transcription, so delaying this
  * response delays the recap itself. Offline, no key, no credit.
  *
- * @param {{ delayMs?: number, decision?: object, recap?: object }} [options]
+ * @param {{ delayMs?: number, decision?: object, recap?: object, debrief?: object }} [options]
  */
 export async function startFakeSarvam(options = {}) {
   const requests = [];
@@ -156,6 +228,23 @@ export async function startFakeSarvam(options = {}) {
     commitments: [],
     missed: [],
     nextActions: [],
+  };
+
+  /** The import pipeline's answer, in the documented debrief shape. */
+  const debrief = options.debrief ?? {
+    summary: 'A pilot call where pricing came up but the budget was never confirmed.',
+    keyDecisions: ['A two-week pilot was agreed before any annual commitment.'],
+    commitments: [
+      { owner: 'you', person: '', what: 'Send the pilot proposal', when: 'Friday' },
+    ],
+    tasks: ['Send the pilot proposal'],
+    suggestedMessage: 'Thanks for the call today. The pilot proposal is coming on Friday.',
+    people: [{ name: 'Priya', context: 'Owns the budget' }],
+    openQuestions: ['Is the budget approved this quarter?'],
+    risks: [{ label: 'Budget timing', detail: 'Budget was mentioned but never confirmed.' }],
+    tone: { label: 'Positive, cautious', note: 'Interested but non-committal.' },
+    relationship: 'Early and warm.',
+    reminders: ['You promised the pilot proposal by Friday.'],
   };
 
   const server = createServer((req, res) => {
@@ -180,7 +269,13 @@ export async function startFakeSarvam(options = {}) {
             choices: [
               {
                 message: {
-                  content: JSON.stringify(schemaName === 'psst_recap' ? recap : decision),
+                  content: JSON.stringify(
+                    schemaName === 'psst_recap'
+                      ? recap
+                      : schemaName === 'psst_debrief'
+                        ? debrief
+                        : decision
+                  ),
                 },
               },
             ],

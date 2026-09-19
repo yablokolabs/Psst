@@ -2,35 +2,42 @@ import { StyleSheet, Text, View, type StyleProp, type ViewStyle } from 'react-na
 
 import { Palette, Radii, Spacing } from '@/constants/theme';
 
-export type RecapTone = 'default' | 'accent' | 'warning' | 'success';
+export type SectionTone = 'default' | 'accent' | 'warning' | 'success';
 
-const TONE_COLORS: Record<RecapTone, string> = {
+const TONE_COLORS: Record<SectionTone, string> = {
   default: Palette.textSecondary,
   accent: Palette.accentSoft,
   warning: Palette.warning,
   success: Palette.success,
 };
 
-export interface RecapSectionProps {
+export interface DebriefSectionProps {
   title: string;
   body?: string;
   items?: string[];
-  /** Renders items as a numbered list (used for next actions). */
+  /** Renders items as a numbered list. */
   numbered?: boolean;
-  tone?: RecapTone;
+  tone?: SectionTone;
+  /** Hide the whole card when there is nothing in it. */
+  hideWhenEmpty?: boolean;
   style?: StyleProp<ViewStyle>;
 }
 
-export function RecapSection({
+export function DebriefSection({
   title,
   body,
   items,
   numbered = false,
   tone = 'default',
+  hideWhenEmpty = false,
   style,
-}: RecapSectionProps) {
-  const hasItems = Array.isArray(items) && items.length > 0;
+}: DebriefSectionProps) {
+  const visibleItems = (items ?? []).filter((item) => item.trim() !== '');
+  const hasItems = visibleItems.length > 0;
   const hasBody = typeof body === 'string' && body.trim() !== '';
+
+  if (hideWhenEmpty && !hasItems && !hasBody) return null;
+
   const accent = TONE_COLORS[tone];
 
   return (
@@ -41,20 +48,16 @@ export function RecapSection({
 
       {hasItems ? (
         <View style={styles.list}>
-          {items.map((item, index) => (
+          {visibleItems.map((item, index) => (
             <View key={`${title}-${index}`} style={styles.itemRow}>
-              <Text style={[styles.marker, { color: accent }]}>
-                {numbered ? `${index + 1}` : '•'}
-              </Text>
+              <Text style={[styles.marker, { color: accent }]}>{numbered ? `${index + 1}` : '•'}</Text>
               <Text style={styles.itemText}>{item}</Text>
             </View>
           ))}
         </View>
       ) : null}
 
-      {!hasBody && !hasItems ? (
-        <Text style={styles.empty}>Nothing captured here.</Text>
-      ) : null}
+      {!hasBody && !hasItems ? <Text style={styles.empty}>Nothing captured here.</Text> : null}
     </View>
   );
 }

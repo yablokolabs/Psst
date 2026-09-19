@@ -2,9 +2,8 @@
  * Psst backend configuration.
  *
  * Pipeline:
- *   phone mic -> Psst Expo app -> secure connection -> Psst backend
- *   -> ElevenLabs realtime STT -> transcript -> conversation state
- *   -> LLM reasoning -> NO_ACTION / PSST -> cue on the phone.
+ *   imported recording -> Psst Expo app -> secure upload -> Psst backend
+ *   -> batch STT -> transcript -> LLM debrief -> debrief on the phone.
  *
  * The backend endpoint and its optional shared token are public values (they
  * ship inside the app bundle); neither is a secret. The shared token is a
@@ -32,33 +31,39 @@ function isDevelopmentBuild(): boolean {
   return typeof globalThis !== 'undefined' && (globalThis as { __DEV__?: unknown }).__DEV__ === true;
 }
 
-export type RealtimeSocketTarget = { url: string } | { error: string };
-
 /**
- * Builds the WebSocket endpoint for a live session from an explicit base URL.
+ * Builds the analysis endpoint an imported recording is uploaded to.
  *
- * Production requires TLS: microphone audio is streamed continuously to a
- * backend that holds provider credentials, so a release build refuses to open an
- * insecure `ws://` connection instead of silently downgrading `http://` to it.
- * A development build may point at a plain `http://`/`ws://` host on the local
- * network (a phone on the same LAN as a dev server, for example).
+ * Production requires TLS: a recording is private audio and the backend holds
+ * provider credentials, so a release build refuses to send it over plain
+ * `http://` instead of silently posting it in the clear. A development build may
+ * point at a plain `http://` host on the local network (a phone on the same LAN
+ * as a dev server, for example).
  *
- * `https` becomes `wss` and `http` becomes `ws`; the scheme is never left
- * implicit, because an insecure transport is the failure mode this guards.
+ * Metadata travels as query parameters rather than form fields: the body stays
+ * the raw audio bytes, so the backend never has to parse multipart and the
+ * upload is a single contiguous stream the phone can report progress for.
  */
-export function buildRealtimeSocketUrl(options: {
+export interface DebriefUploadRequest {
+  /** `https://host[:port][/path]` for the analysis endpoint. */
+  url: string;
+}
+
+export function buildDebriefEndpoint(options: {
   baseUrl: string;
-  sessionId: string;
   token?: string;
-  /** Development builds may use a plain http/ws backend. */
+  callType: string;
+  title: string;
+  contact: string;
+  durationMs: number;
   development?: boolean;
-}): RealtimeSocketTarget {
+}): DebriefUploadRequest | { error: string } {
   const baseUrl = (options.baseUrl ?? '').trim().replace(/\/+$/, '');
 
   if (baseUrl === '') {
     return {
       error:
-        'Realtime sessions need EXPO_PUBLIC_PSST_BACKEND_URL. Add it and rebuild to stream audio.',
+        'Analysis needs EXPO_PUBLIC_PSST_BACKEND_URL. Add it and rebuild, or use the offline demo debrief.',
     };
   }
 
@@ -77,24 +82,35 @@ export function buildRealtimeSocketUrl(options: {
   if (!secure && options.development !== true) {
     return {
       error:
-        'Psst will not stream audio over an insecure connection in a release build. Use an https:// backend URL.',
+        'Psst will not upload a recording over an insecure connection in a release build. Use an https:// backend URL.',
     };
   }
 
-  const url = `${secure ? 'wss' : 'ws'}://${authority}${basePath}/sessions/${encodeURIComponent(
-    options.sessionId
-  )}/stream`;
-
+  const query = new URLSearchParams({
+    callType: options.callType,
+    title: options.title,
+    contact: options.contact,
+    durationMs: String(Math.max(0, Math.round(options.durationMs))),
+  });
   const token = options.token ?? '';
-  return { url: token === '' ? url : `${url}?token=${encodeURIComponent(token)}` };
+  if (token !== '') query.set('token', token);
+
+  // `ws`/`wss` are accepted in configuration for backward compatibility, but an
+  // upload is HTTP, so the transport scheme is http/https either way.
+  return { url: `${secure ? 'https' : 'http'}://${authority}${basePath}/debrief?${query.toString()}` };
 }
 
-/** Resolves the endpoint for a live session from the configured environment. */
-export function resolveRealtimeSocketTarget(sessionId: string): RealtimeSocketTarget {
-  return buildRealtimeSocketUrl({
+/** Resolves the upload endpoint from the configured environment. */
+export function resolveDebriefUpload(draft: {
+  callType: string;
+  title: string;
+  contact: string;
+  durationMs: number;
+}): DebriefUploadRequest | { error: string } {
+  return buildDebriefEndpoint({
     baseUrl: PSST_BACKEND_URL,
-    sessionId,
     token: PSST_BACKEND_TOKEN,
     development: isDevelopmentBuild(),
+    ...draft,
   });
 }

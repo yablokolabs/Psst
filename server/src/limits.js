@@ -43,6 +43,15 @@ export const LIMITS = {
   maxSessionDurationMs: readLimit('PSST_MAX_SESSION_DURATION_MS', 3600000),
   /** Client messages accepted per second before frames are dropped. */
   maxMessagesPerSecond: readLimit('PSST_MAX_MESSAGES_PER_SEC', 300),
+
+  /** Largest recording accepted for import analysis. */
+  maxImportBytes: readLimit('PSST_MAX_IMPORT_BYTES', 50 * 1024 * 1024),
+  /** Longest recording accepted for import analysis, measured from the transcript. */
+  maxImportDurationMs: readLimit('PSST_MAX_IMPORT_DURATION_MS', 4 * 60 * 60 * 1000),
+  /** Imports started per minute, process-wide. */
+  maxImportsPerMinute: readLimit('PSST_MAX_IMPORTS_PER_MINUTE', 6),
+  /** Imports being transcribed at the same time. */
+  maxConcurrentImports: readLimit('PSST_MAX_CONCURRENT_IMPORTS', 2),
 };
 
 /** Numbers only: safe to log and to serve from /health. */

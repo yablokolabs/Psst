@@ -1,23 +1,24 @@
 /** FREE vs PSST PRO limits and copy. Single source of truth for gating. */
 
-export const FREE_LIVE_MINUTES = 10;
-export const FREE_LIVE_LIMIT_MS = FREE_LIVE_MINUTES * 60 * 1000;
-/** How many conversations the free tier keeps in history. */
+/** How many debriefs the free tier keeps in the timeline. */
 export const FREE_HISTORY_LIMIT = 3;
 
+/** Recordings the free tier will analyse each month. */
+export const FREE_IMPORTS_PER_MONTH = 5;
+
 export const FREE_FEATURES = [
-  'Unlimited prep sessions',
-  `Live Psst cues for the first ${FREE_LIVE_MINUTES} minutes`,
-  'Basic recap after every session',
-  `Last ${FREE_HISTORY_LIMIT} conversations in your history`,
+  `${FREE_IMPORTS_PER_MONTH} recordings analysed each month`,
+  'Summary, decisions, commitments and follow-ups',
+  `Last ${FREE_HISTORY_LIMIT} debriefs in your timeline`,
+  'Reminders and copy-ready follow-up messages',
 ];
 
 export const PRO_FEATURES = [
-  'Extended live sessions with no time limit',
-  'Advanced Psst cues tuned to your goal',
-  'Full conversation history',
-  'Advanced recap: commitments, missed moments and next actions',
-  'Early access to personalisation and voice profiles',
+  'Unlimited recordings analysed',
+  'Your full debrief timeline, searchable forever',
+  'Deeper debriefs tuned to the kind of call',
+  'Track follow-ups across every call and contact',
+  'Early access to voice profiles and integrations',
 ];
 
-export const PRO_TAGLINE = 'Know what to say next — for the whole conversation.';
+export const PRO_TAGLINE = 'Remember every call, not just the ones you have time to think about.';

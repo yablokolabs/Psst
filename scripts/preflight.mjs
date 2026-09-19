@@ -2,28 +2,25 @@
 /**
  * Device-run preflight.
  *
- * Answers one question before you pick up the phone: *will the device's exact
- * endpoint accept a session right now?* It walks the same path the app walks —
- * `GET /health`, then a real WebSocket session (`session.start` -> `listening`
- * -> `session.stop` -> `recap` -> `ended`) over the URL you are about to build
- * into the app.
+ * Answers one question before you pick up the phone: *will the app's exact
+ * endpoint do the import right now?* It checks the same URL, over the same
+ * transport, that the build bakes in.
  *
  * It is deliberately cheap and safe:
- *   - no audio frames are sent, so no STT session is opened and no transcription
- *     credit is used
- *   - no transcript exists at the end, so the recap is built locally without a
- *     model call
- *   - it uses one session slot for a few seconds and disconnects
+ *   - `GET /health` only reports booleans, names and numbers
+ *   - the two POSTs are rejected **before** any audio is read: one has a
+ *     non-audio content type, one omits the token when a token is required
+ *   - no recording is uploaded, so no transcription credit is used and no
+ *     provider call is made
  *
  * Usage:
- *   npm run preflight                              # EXPO_PUBLIC_PSST_BACKEND_URL
- *   npm run preflight -- --url https://tunnel.example.com
- *   npm run preflight -- --url http://127.0.0.1:8787   # local backend only
+ *   npm run preflight                                       # EXPO_PUBLIC_PSST_BACKEND_URL
+ *   npm run preflight -- --url https://psst.example.com
+ *   npm run preflight -- --url http://127.0.0.1:8787        # local backend only
  *
- * The URL handling mirrors `src/services/backend.ts`: `https` becomes `wss`,
- * `http` becomes `ws`. A **release** build (the `preview`/`production` profiles)
- * refuses a non-TLS backend, so `http`/`ws` is only useful for a development
- * build or for a local check.
+ * The URL handling mirrors `src/services/backend.ts`: `https` stays secure. A
+ * **release** build (the `preview`/`production` profiles) refuses a non-TLS
+ * backend, so `http` is only useful for a development build or a local check.
  */
 
 import { existsSync } from 'node:fs';
@@ -50,15 +47,16 @@ function loadLocalEnv() {
 }
 
 const HEALTH_TIMEOUT_MS = 10000;
-const SOCKET_OPEN_TIMEOUT_MS = 10000;
-const LISTENING_TIMEOUT_MS = 10000;
-const RECAP_TIMEOUT_MS = 15000;
+const REJECT_TIMEOUT_MS = 10000;
 
 /** Mirrors the base-URL handling in `src/services/backend.ts`. */
 const BACKEND_URL_PATTERN = /^(https?|wss?):\/\/([^/?#\s]+)(\/[^?#\s]*)?$/i;
 
 function readArgs(argv) {
-  const args = { url: process.env.EXPO_PUBLIC_PSST_BACKEND_URL ?? '', token: process.env.EXPO_PUBLIC_PSST_BACKEND_TOKEN ?? '' };
+  const args = {
+    url: process.env.EXPO_PUBLIC_PSST_BACKEND_URL ?? '',
+    token: process.env.EXPO_PUBLIC_PSST_BACKEND_TOKEN ?? '',
+  };
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === '--url') args.url = argv[index + 1] ?? '';
@@ -94,18 +92,17 @@ function isPrivateHost(hostname) {
   );
 }
 
-/** `https://host` -> `wss://host/sessions/<id>/stream`, mirroring the app. */
-function toSocketUrl(baseUrl, sessionId, token) {
-  const match = BACKEND_URL_PATTERN.exec(baseUrl.trim().replace(/\/+$/, ''));
+/** Parses the configured base URL the way the app does. */
+function parseBackendUrl(baseUrl) {
+  const match = BACKEND_URL_PATTERN.exec((baseUrl ?? '').trim().replace(/\/+$/, ''));
   if (!match) return null;
 
   const scheme = match[1].toLowerCase();
   const secure = scheme === 'https' || scheme === 'wss';
-  const url = `${secure ? 'wss' : 'ws'}://${match[2]}${match[3] ?? ''}/sessions/${encodeURIComponent(
-    sessionId
-  )}/stream`;
-
-  return { url: token === '' ? url : `${url}?token=${encodeURIComponent(token)}`, secure };
+  return {
+    secure,
+    base: `${secure ? 'https' : 'http'}://${match[2]}${match[3] ?? ''}`,
+  };
 }
 
 async function checkHealth(baseUrl) {
@@ -113,120 +110,77 @@ async function checkHealth(baseUrl) {
   try {
     response = await fetch(`${baseUrl}/health`, { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
   } catch (error) {
-    return { ok: false, detail: `GET /health failed: ${error instanceof Error ? error.message : String(error)}` };
+    return {
+      ok: false,
+      detail: `GET /health failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
   }
 
   if (!response.ok) return { ok: false, detail: `GET /health returned HTTP ${response.status}` };
 
-  let health;
   try {
-    health = await response.json();
+    return { ok: true, health: await response.json() };
   } catch {
     return { ok: false, detail: 'GET /health returned non-JSON' };
   }
-
-  return { ok: true, health };
 }
 
 /**
- * One full session over the real URL: start, listening, stop, recap, ended.
- * Resolves with per-step timings so a slow link is visible before the run.
+ * One rejection the backend must produce without reading any audio.
+ *
+ * This is the whole point of the preflight: it proves the import route exists,
+ * that the transport works from this URL, and that the gate in front of the
+ * provider behaves, at zero cost.
  */
-function checkSession(socketUrl) {
-  return new Promise((resolve) => {
-    const startedAt = Date.now();
-    const steps = {};
-    const frames = [];
-    const socket = new WebSocket(socketUrl);
+async function expectRejection(baseUrl, { label, contentType, token }) {
+  const params = new URLSearchParams({ callType: 'other', title: 'preflight', contact: '' });
+  if (token) params.set('token', token);
 
-    const finish = (ok, detail) => {
-      clearTimeout(timer);
-      try {
-        socket.close();
-      } catch {
-        // Already closing.
-      }
-      resolve({ ok, detail, steps, frames });
-    };
+  let response;
+  try {
+    response = await fetch(`${baseUrl}/debrief?${params.toString()}`, {
+      method: 'POST',
+      headers: { 'content-type': contentType },
+      body: Buffer.from('preflight-probe'),
+      signal: AbortSignal.timeout(REJECT_TIMEOUT_MS),
+    });
+  } catch (error) {
+    return { ok: false, detail: `${label}: request failed (${error instanceof Error ? error.message : String(error)})` };
+  }
 
-    const timer = setTimeout(() => finish(false, 'timed out waiting for the session to finish'), RECAP_TIMEOUT_MS);
-
-    socket.onopen = () => {
-      steps.openedMs = Date.now() - startedAt;
-      socket.send(
-        JSON.stringify({
-          t: 'session.start',
-          goal: {
-            title: 'Preflight check',
-            objective: 'Confirm the device endpoint accepts a session.',
-            notes: '',
-            preset: 'other',
-          },
-          client: { platform: 'preflight', appVersion: '1.0.0' },
-        })
-      );
-    };
-
-    socket.onerror = (event) => {
-      finish(false, `WebSocket error: ${event?.message ?? 'connection failed'}`);
-    };
-
-    socket.onmessage = (event) => {
-      let message = null;
-      try {
-        message = JSON.parse(String(event.data));
-      } catch {
-        return;
-      }
-      frames.push(message.t);
-
-      if (message.t === 'status' && message.status === 'listening' && !steps.listeningMs) {
-        steps.listeningMs = Date.now() - startedAt;
-        // Nothing to transcribe: end immediately, which is exactly the recap
-        // path the device exercises when a user taps End.
-        socket.send(JSON.stringify({ t: 'session.stop' }));
-      } else if (message.t === 'status' && message.status === 'ended') {
-        steps.endedMs = Date.now() - startedAt;
-      } else if (message.t === 'recap') {
-        steps.recapMs = Date.now() - startedAt;
-        finish(true, `recap "${message.recap?.title ?? '(untitled)'}" in ${steps.recapMs} ms`);
-      } else if (message.t === 'error') {
-        finish(false, `backend error frame: ${message.message}`);
-      }
-    };
-
-    socket.onclose = (event) => {
-      if (process.exitCode === 1) return;
-      if (steps.recapMs) return;
-      finish(false, `socket closed before the recap (code ${event?.code ?? '?'})`);
-    };
-  });
+  let message = '';
+  try {
+    message = String((await response.json())?.error ?? '');
+  } catch {
+    message = '';
+  }
+  return { ok: true, status: response.status, message };
 }
 
 async function main() {
   loadLocalEnv();
   const args = readArgs(process.argv.slice(2));
-  const baseUrl = (args.url.trim() || 'http://127.0.0.1:8787').replace(/\/+$/, '');
+  const rawBase = args.url.trim() || 'http://127.0.0.1:8787';
+  const parsed = parseBackendUrl(rawBase);
 
-  console.log('Psst preflight — device run\n');
+  console.log('Psst preflight — import path\n');
 
-  const target = toSocketUrl(baseUrl, 'preflight-check', args.token);
-  if (!target) {
-    report(false, 'backend URL', `"${baseUrl}" is not a valid URL. Use https://your-backend.example.com`);
+  if (!parsed) {
+    report(false, 'backend URL', `"${rawBase}" is not a valid URL. Use https://your-backend.example.com`);
     return;
   }
 
-  const socketHost = new URL(target.url).hostname;
-  const privateHost = isPrivateHost(socketHost);
+  const baseUrl = parsed.base;
+  const host = new URL(baseUrl).hostname;
+  const privateHost = isPrivateHost(host);
 
-  if (target.secure) {
-    report(true, 'TLS transport', 'https/wss, accepted by release builds');
+  if (parsed.secure) {
+    report(true, 'TLS transport', 'https, accepted by release builds');
   } else if (privateHost) {
-    // Fine for a local check or a development build; a release build refuses it.
-    warn('TLS transport', `${baseUrl} is http/ws — a release (preview/production) build will refuse it`);
+    warn('TLS transport', `${baseUrl} is http — a release (preview/production) build will refuse to upload to it`);
   } else {
-    report(false, 'TLS transport', `${baseUrl} is http/ws — a release build refuses to stream audio over it`);
-    note('use an https URL for the phone:', 'a Cloudflare quick tunnel gives one without a domain');
+    report(false, 'TLS transport', `${baseUrl} is http — a release build refuses to upload a recording over it`);
+    note('use an https URL for the phone', 'a Cloudflare tunnel or the named tunnel gives you one');
   }
 
   const health = await checkHealth(baseUrl);
@@ -237,17 +191,18 @@ async function main() {
   report(true, 'backend reachable', `${baseUrl}/health`);
 
   const { health: data } = health;
+  const limits = data.limits ?? {};
+
   report(data.status === 'ok', 'health status', String(data.status));
+  report(data.importAnalysisReady === true, 'import analysis ready', String(data.importAnalysisReady));
   report(data.elevenlabsConfigured === true, 'ElevenLabs configured (server-side)', String(data.elevenlabsConfigured));
-  report(data.sarvamConfigured === true, 'Sarvam configured (server-side)', String(data.sarvamConfigured));
-  note('commit strategy', String(data.elevenlabsCommitStrategy ?? '?'));
-  note('language code', String(data.elevenlabsLanguageCode ?? '(auto)'));
-  note('min cue interval', `${data.minCueIntervalMs ?? '?'} ms`);
-  note('active sessions', `${data.activeSessions ?? '?'} / ${data.limits?.maxSessions ?? '?'}`);
-  note(
-    'session ceilings',
-    `audio ${data.limits?.maxSessionAudioBytes ?? '?'} B, duration ${data.limits?.maxSessionDurationMs ?? '?'} ms, idle ${data.limits?.idleTimeoutMs ?? '?'} ms`
-  );
+  note('batch model', String(data.batchSttModel ?? '?'));
+  note('diarization', String(data.batchSttDiarize ?? '?'));
+  note('analysis model', `${data.sarvamConfigured === true ? data.sarvamModel : 'not configured — transcript only'}`);
+  note('import ceilings', `bytes ${limits.maxImportBytes ?? '?'}, duration ${limits.maxImportDurationMs ?? '?'} ms`);
+  note('import throughput', `${limits.maxImportsPerMinute ?? '?'}/min, ${limits.maxConcurrentImports ?? '?'} at once`);
+  note('active imports', String(data.activeImports ?? '?'));
+  note('token required', String(data.tokenRequired ?? '?'));
 
   const serialized = JSON.stringify(data);
   report(
@@ -256,24 +211,46 @@ async function main() {
     'keys stay server-side'
   );
 
-  const session = await checkSession(target.url);
-  report(session.ok, 'full session over the device URL', session.detail);
-  if (session.steps.openedMs !== undefined) note('handshake', `${session.steps.openedMs} ms`);
-  if (session.steps.listeningMs !== undefined) note('to listening', `${session.steps.listeningMs} ms`);
-  if (session.steps.recapMs !== undefined) note('to recap', `${session.steps.recapMs} ms`);
-  note('frames', session.frames.join(', ') || '(none)');
+  const wrongType = await expectRejection(baseUrl, {
+    label: 'non-audio upload',
+    contentType: 'application/json',
+    token: args.token,
+  });
+  report(
+    wrongType.ok && wrongType.status === 400,
+    'the import route rejects a non-audio body',
+    wrongType.ok ? `HTTP ${wrongType.status}${wrongType.message ? ` — ${wrongType.message}` : ''}` : wrongType.detail
+  );
+
+  if (data.tokenRequired === true) {
+    const noToken = await expectRejection(baseUrl, {
+      label: 'missing token',
+      contentType: 'audio/mp4',
+      token: '',
+    });
+    report(
+      noToken.ok && noToken.status === 401,
+      'the import route requires the token this build sends',
+      noToken.ok ? `HTTP ${noToken.status}` : noToken.detail
+    );
+
+    if (args.token === '') {
+      warn('no client token in this shell', 'EXPO_PUBLIC_PSST_BACKEND_TOKEN is empty, so a real import would be refused');
+    }
+  }
 
   if (process.exitCode === 1) {
     console.log('\nFix the FAIL lines above before starting a phone run.');
     return;
   }
 
-  console.log('\nReady for the S24 run.');
-  if (privateHost || !target.secure) {
-    console.log('NOTE: that was a local check. The phone cannot reach a private address — build with a public https URL.');
+  console.log('\nThe import path is reachable from this URL.');
+  if (privateHost || !parsed.secure) {
+    console.log('NOTE: that was a local check. A phone cannot reach a private address — build with a public https URL.');
   }
   console.log(`Bake this into the build:  EXPO_PUBLIC_PSST_BACKEND_URL=${baseUrl}`);
   console.log('Then follow the S24 acceptance checklist in README.md.');
+  console.log('\n(No recording was uploaded and no provider call was made.)');
 }
 
 await main();
