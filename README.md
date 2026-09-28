@@ -207,6 +207,12 @@ a provider key there would be one `EXPO_PUBLIC_` prefix away from the bundle. Op
 without throwing, so a build without it still runs the whole import flow. Entitlement is presentational
 until the backend verifies it: server-side entitlement is a public-release gate.
 
+Until Psst exists in Google Play the only key we have is a Test Store key (`test_…`), and the SDK
+deliberately closes the app when it finds one in a build that is not debuggable. That is why
+`plugins/with-test-store-debuggable.js` marks the `preview` profile debuggable: it is gated on the EAS
+profile name, so `production` can never pick it up. Swapping in the real `goog_…` key retires the
+plugin and the profile can go back to a plain release build.
+
 ## Backend limits
 
 Everything a hostile or broken client could grow without bound has a ceiling, all overridable by
