@@ -57,6 +57,7 @@
     "server:start": "npm --prefix server start",
     "server:smoke": "npm --prefix server run smoke",
     "server:providers": "npm --prefix server run providers",
+    "server:songua": "npm --prefix server run songua --",
     "preflight": "node scripts/preflight.mjs"
   },
   "private": true

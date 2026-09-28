@@ -37,6 +37,7 @@ import { encode, noticeMessage, parseClientMessage, recapMessage, statusMessage 
 import { buildRecap, createReasoningProvider } from './reasoning.js';
 import { SarvamReasoningProvider, getSarvamConfig, isSarvamConfigured } from './sarvam.js';
 import { ConversationSession } from './session.js';
+import { getFalConfig, isFalConfigured } from './songua/fal.js';
 import { getBatchSttConfig, isBatchSttConfigured, transcribeRecording } from './stt.js';
 import { attachTranscription } from './transcription.js';
 import { MIN_CUE_INTERVAL_MS } from './cue.js';
@@ -378,6 +379,7 @@ function handleRequest(req, res) {
   if (req.method === 'GET' && url.pathname === '/health') {
     const elevenlabs = getElevenLabsConfig();
     const batchStt = getBatchSttConfig();
+    const fal = getFalConfig();
     sendJson(res, 200, {
       status: 'ok',
       service: 'psst-backend',
@@ -390,6 +392,15 @@ function handleRequest(req, res) {
       importAnalysisReady: isBatchSttConfigured(),
       batchSttModel: batchStt.modelId,
       batchSttDiarize: batchStt.diarize,
+      // Songua's clip pipeline. It needs all three providers: transcription for
+      // the lyrics and their timings, Sarvam for the singable translation, and
+      // fal for stem separation and the re-sung audio. Reported as one boolean
+      // because a partially configured pipeline cannot produce a clip at all.
+      falConfigured: isFalConfigured(),
+      songuaPipelineReady:
+        isFalConfigured() && isBatchSttConfigured() && isSarvamConfigured(),
+      demucsModel: fal.demucsModel,
+      aceStepModel: fal.aceStepModel,
       elevenlabsModel: elevenlabs.modelId,
       elevenlabsCommitStrategy: elevenlabs.commitStrategy,
       elevenlabsCommitStrategyRejected: elevenlabs.commitStrategyRejected,
