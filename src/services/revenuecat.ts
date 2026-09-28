@@ -14,7 +14,12 @@ import type { CustomerInfo } from 'react-native-purchases';
 
 type PurchasesClass = (typeof import('react-native-purchases'))['default'];
 
-export const PRO_ENTITLEMENT_ID = 'pro';
+/**
+ * Must match the entitlement identifier in the RevenueCat dashboard exactly
+ * (Project -> Entitlements). A mismatch is silent: the paywall purchases,
+ * `entitlements.active` has no such key, and the app still reads as free.
+ */
+export const PRO_ENTITLEMENT_ID = 'create_a_project_called_psst_pro';
 export const REVENUECAT_PUBLIC_SDK_KEY = process.env.EXPO_PUBLIC_REVENUECAT_API_KEY ?? '';
 
 export type PurchasesAvailability =
