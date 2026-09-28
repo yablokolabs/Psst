@@ -37,6 +37,8 @@ const LINE_GAP_MS = 700;
 /** Lines are capped so one hostile file cannot grow an unbounded response. */
 const MAX_LINES = 4000;
 const MAX_LINE_CHARS = 1000;
+/** Word timings are opt-in; when asked for, they are capped the same way. */
+const MAX_WORDS = 20000;
 
 export function isBatchSttConfigured() {
   // Boolean only: never the key, never its length.
@@ -160,17 +162,52 @@ function buildLines(words) {
 }
 
 /**
+ * Keeps only the word entries, clamped in count and shape.
+ *
+ * The raw provider array is copied rather than passed through: it arrives from a
+ * network response, and the only fields any caller may rely on are the text and
+ * the two second-valued timings.
+ */
+function normalizeWords(words) {
+  const out = [];
+  for (const word of words) {
+    if (out.length >= MAX_WORDS) break;
+    if (!word || typeof word !== 'object') continue;
+    const text = typeof word.text === 'string' ? word.text.trim() : '';
+    if (text === '') continue;
+    out.push({
+      text,
+      type: typeof word.type === 'string' ? word.type : 'word',
+      start: typeof word.start === 'number' ? word.start : null,
+      end: typeof word.end === 'number' ? word.end : null,
+    });
+  }
+  return out;
+}
+
+/**
  * Transcribes one recording.
  *
  * Never throws: a provider failure is a returned result, because the caller has
  * to answer with an HTTP status rather than crash the backend.
  *
+ * Word timings are opt-in. The import pipeline only ever needed grouped lines, so
+ * `words` is omitted by default rather than shipped to every caller: a whole
+ * song's word list is large, and /debrief has no use for it.
+ *
  * @returns {Promise<
- *   { ok: true, text: string, languageCode: string, lines: Array<object>, durationMs: number }
+ *   { ok: true, text: string, languageCode: string, lines: Array<object>, durationMs: number, words?: Array<object> }
  *   | { ok: false, error: string }
  * >}
  */
-export async function transcribeRecording({ bytes, fileName, mimeType, fetchImpl, signal }) {
+export async function transcribeRecording({
+  bytes,
+  fileName,
+  mimeType,
+  fetchImpl,
+  signal,
+  includeWords = false,
+}) {
   const apiKey = getElevenLabsApiKey();
   if (apiKey === '') {
     return { ok: false, error: 'batch-stt-not-configured' };
@@ -240,6 +277,7 @@ export async function transcribeRecording({ bytes, fileName, mimeType, fetchImpl
       languageCode: typeof payload?.language_code === 'string' ? payload.language_code : '',
       lines,
       durationMs: Math.round(lastEnd * 1000),
+      ...(includeWords ? { words: normalizeWords(words) } : {}),
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
